@@ -708,6 +708,94 @@ class TestScheduleTimezone(SentryTest):
             sentry.poll_interval(dt.datetime(2026, 7, 29, 15, 0)), 60)
 
 
+class TestEnvOverrides(SentryTest):
+    """Secrets come from the orchestrator on a VPS, not from a file on disk."""
+
+    def apply(self, **env):
+        base = {"channels": {"telegram": {"enabled": False, "token": "FILE",
+                                          "chat_id": "1"},
+                             "ntfy": {"enabled": False, "topic": "file-topic"}},
+                "healthchecks_url": "", "target_dates": []}
+        with mock.patch.dict(os.environ, env, clear=False):
+            return sentry.apply_env(copy.deepcopy(base))
+
+    def test_env_token_wins_and_enables_channel(self):
+        cfg = self.apply(TELEGRAM_TOKEN="ENVTOKEN", TELEGRAM_CHAT_ID="999")
+        self.assertEqual(cfg["channels"]["telegram"]["token"], "ENVTOKEN")
+        self.assertEqual(cfg["channels"]["telegram"]["chat_id"], "999")
+        self.assertTrue(cfg["channels"]["telegram"]["enabled"])
+
+    def test_config_file_used_when_env_absent(self):
+        cfg = self.apply()
+        self.assertEqual(cfg["channels"]["telegram"]["token"], "FILE")
+        self.assertFalse(cfg["channels"]["telegram"]["enabled"])
+
+    def test_comma_lists_are_split_and_trimmed(self):
+        cfg = self.apply(TELEGRAM_EXTRA_CHAT_IDS=" -100123 , @chan ",
+                         TARGET_DATES="2026-08-21,2026-08-22")
+        self.assertEqual(cfg["channels"]["telegram"]["extra_chat_ids"],
+                         ["-100123", "@chan"])
+        self.assertEqual(cfg["target_dates"],
+                         ["2026-08-21", "2026-08-22"])
+
+    def test_ntfy_topic_from_env_enables_with_default_server(self):
+        cfg = self.apply(NTFY_TOPIC="envtopic")
+        self.assertEqual(cfg["channels"]["ntfy"]["topic"], "envtopic")
+        self.assertEqual(cfg["channels"]["ntfy"]["server"], "https://ntfy.sh")
+        self.assertTrue(cfg["channels"]["ntfy"]["enabled"])
+
+    def test_healthchecks_and_tz_from_env(self):
+        cfg = self.apply(HEALTHCHECKS_URL="https://hc.example/ping",
+                         SCHEDULE_TZ="America/Chicago")
+        self.assertEqual(cfg["healthchecks_url"], "https://hc.example/ping")
+        self.assertEqual(cfg["schedule_tz"], "America/Chicago")
+
+
+class TestUnconfiguredChannelFails(SentryTest):
+    """push() returning True advances the horizon — a channel that is not
+    actually configured must never contribute to that."""
+
+    def test_blank_ntfy_topic_raises_instead_of_reporting_success(self):
+        sentry.CFG["channels"]["ntfy"]["topic"] = ""
+        with self.assertRaises(RuntimeError):
+            sentry.send_ntfy(sentry.CFG["channels"]["ntfy"], "t", "b", "urgent")
+
+    def test_push_is_false_when_every_channel_is_unconfigured(self):
+        sentry.CFG["channels"]["whatsapp"]["enabled"] = False
+        sentry.CFG["channels"]["telegram"]["enabled"] = False
+        sentry.CFG["channels"]["ntfy"]["topic"] = ""
+        with mock.patch.object(sentry.urllib.request, "urlopen") as u:
+            self.assertFalse(sentry.push("DROP", "body", priority="urgent"))
+        u.assert_not_called()
+
+    def test_horizon_holds_when_the_only_channel_is_misconfigured(self):
+        sentry.CFG["channels"]["whatsapp"]["enabled"] = False
+        sentry.CFG["channels"]["telegram"]["enabled"] = False
+        sentry.CFG["channels"]["ntfy"]["topic"] = ""
+        with mock.patch.object(sentry.urllib.request, "urlopen"):
+            sentry.handle_drop(self.st, "AABQI",
+                               {"2026-08-20": {"total": 2, "open": 2}})
+        self.assertEqual(self.st["horizon"]["AABQI"], "2026-08-19")
+        self.assertEqual(self.st["announced"], [])
+
+
+class TestBlockDetection(SentryTest):
+    def test_degraded_alert_names_ip_blocking_on_403(self):
+        self.st["lastFetch"] = {"ok": False, "error": "HTTP Error 403: Forbidden"}
+        self.st["breaker"]["failures"] = 5
+        with mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.breaker_fail(self.st)
+        self.assertIn("IP-level blocking", p.call_args.args[1])
+        self.assertIn("403", p.call_args.args[1])
+
+    def test_generic_failure_does_not_blame_the_ip(self):
+        self.st["lastFetch"] = {"ok": False, "error": "timed out"}
+        self.st["breaker"]["failures"] = 5
+        with mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.breaker_fail(self.st)
+        self.assertNotIn("IP-level blocking", p.call_args.args[1])
+
+
 class TestSingleFlight(SentryTest):
     def setUp(self):
         super().setUp()

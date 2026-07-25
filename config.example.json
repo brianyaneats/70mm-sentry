@@ -19,9 +19,9 @@
       "extra_chat_ids": []
     },
     "ntfy": {
-      "enabled": true,
+      "enabled": false,
       "server": "https://ntfy.sh",
-      "topic": "CHANGE-ME-random-secret-topic"
+      "topic": ""
     }
   },
   "healthchecks_url": "",

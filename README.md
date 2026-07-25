@@ -74,6 +74,52 @@ launchd fires every 10 s but a probe-hit sweep runs 60–90 s. `flock` on
 *before* the long work so a later fire sees a fresh timestamp instead of
 starting a duplicate cycle and clobbering state at the moment of a drop.
 
+## Running on a VPS (Docker)
+
+The image is stdlib-only Python on `python:3.12-slim` — no `pip install`, no
+requirements file, no supply chain. Code lives read-only in the image; every
+mutable file (`config.json`, `state.json`, logs, lock) lives on a mounted
+volume, so the image itself is secret-free and safe to push to a registry.
+
+```bash
+cp config.example.json config.json      # fill in venues/targets, leave secrets blank
+cat > .env <<'EOF'
+TELEGRAM_TOKEN=<botfather-token>
+TELEGRAM_CHAT_ID=<your-chat-id>
+TELEGRAM_EXTRA_CHAT_IDS=<subscriber-channel-id>
+HEALTHCHECKS_URL=https://hc-ping.com/<uuid>
+TARGET_DATES=2026-08-21,2026-08-22,2026-08-26
+EOF
+chmod 600 .env
+docker compose up -d --build
+docker compose logs -f
+```
+
+Secrets come from the environment and **override** `config.json`, so nothing
+sensitive has to sit on the VPS disk. `entrypoint.sh` replaces launchd: a
+10 s tick for the sentry (which applies its own cadence gate and flock) and
+a 300 s tick for the watchdog — identical behaviour to the macOS plists.
+`docker compose restart` is the documented recovery, and the watchdog's
+SENTRY DOWN alert prints that command instead of the `launchctl` one when it
+detects it is containerised.
+
+`TZ` and `SCHEDULE_TZ` are both set to `America/New_York` in the compose
+file: cadence windows follow the theater's clock wherever the box lives.
+
+**Keep `./data` across deploys.** Losing `state.json` re-announces every date
+you have already been told about and resets the horizon to `seed_horizon`.
+
+### The IP caveat
+
+Fandango's `robots.txt` disallows `/napi/`, and this endpoint answers a
+residential address far more readily than a datacenter one. A VPS is
+therefore *more* likely to be refused, not less — the trade is uptime for
+reachability. The breaker already backs off on failures, and the degraded
+alert now names IP-level blocking explicitly when it sees 403/429/503 so the
+diagnosis is immediate rather than a mystery outage. If that fires
+repeatedly, the fix is moving back to a residential IP, not tuning the
+watcher.
+
 ## Observability
 
 Three distinct silent-failure modes, three separate alarms — a quiet log looks
@@ -156,7 +202,7 @@ To go WhatsApp-only, set `channels.ntfy.enabled: false`.
 cd ~/Developer/70mm-sentry && python3 -m unittest discover -s tests -v
 ```
 
-69 unit tests, all network mocked: 70mm detection (incl. soldout/restricted
+97 unit tests, all network mocked: 70mm detection (incl. soldout/restricted
 typing), drop handling (horizon advances only on delivered alerts; failed
 push retries), sweep cutoff, budget rollover/exhaustion, breaker
 open/half-open/recover + single degraded alert, notifier fan-out (one channel

@@ -1,0 +1,13 @@
+.git
+.gitignore
+data/
+config.json
+state.json
+watchdog_state.json
+last_response.json
+.sentry.lock
+*.log
+__pycache__/
+tests/
+README.md
+*.plist

@@ -1,0 +1,40 @@
+services:
+  sentry:
+    build: .
+    image: 70mm-sentry:latest
+    container_name: 70mm-sentry
+    restart: unless-stopped
+
+    environment:
+      # cadence windows are evaluated in the THEATER's zone, not the host's
+      TZ: America/New_York
+      SCHEDULE_TZ: America/New_York
+      # secrets: set these in a .env file next to this compose file so they
+      # never land in config.json on the VPS disk
+      TELEGRAM_TOKEN: ${TELEGRAM_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      TELEGRAM_EXTRA_CHAT_IDS: ${TELEGRAM_EXTRA_CHAT_IDS:-}
+      NTFY_TOPIC: ${NTFY_TOPIC:-}
+      HEALTHCHECKS_URL: ${HEALTHCHECKS_URL:-}
+      TARGET_DATES: ${TARGET_DATES:-}
+
+    volumes:
+      # state.json, logs and the lock live here and must survive restarts —
+      # losing state.json re-alerts every date you have already been told about
+      - ./data:/data
+      # config.json read-only: the container never rewrites your config
+      - ./config.json:/data/config.json:ro
+
+    # a watcher should never be the reason a box falls over
+    mem_limit: 128m
+    pids_limit: 64
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

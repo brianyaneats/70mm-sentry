@@ -19,9 +19,10 @@ import sys
 import sentry
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-WD_STATE = os.path.join(BASE, "watchdog_state.json")
-LOG_PATH = os.path.join(BASE, "watchdog.log")
-LAUNCHD_LOG = os.path.join(BASE, "launchd.log")
+DATA = os.environ.get("SENTRY_DATA") or BASE
+WD_STATE = os.path.join(DATA, "watchdog_state.json")
+LOG_PATH = os.path.join(DATA, "watchdog.log")
+LAUNCHD_LOG = os.path.join(DATA, "launchd.log")
 
 ERROR_HINTS = ("Traceback", "Error", "error:", "not agreed", "No such file",
                "command not found", "Permission denied", "Killed")
@@ -107,8 +108,10 @@ def check(now=None):
                     f"You are NOT being watched right now.")
             if errs:
                 body += "\nLast errors:\n" + "\n".join(errs)
-            body += f"\nRestart: launchctl kickstart -k gui/{os.getuid()}/" \
-                    f"com.brianyan.70mm-sentry"
+            body += "\nRestart: " + (
+                "docker compose restart" if os.environ.get("SENTRY_DATA")
+                else f"launchctl kickstart -k gui/{os.getuid()}/"
+                     f"com.brianyan.70mm-sentry")
             if sentry.push("SENTRY DOWN", body, priority="urgent"):
                 wd["lastAlertAt"] = now.isoformat()
                 # only an outage you were TOLD about earns an all-clear

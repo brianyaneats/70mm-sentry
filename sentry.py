@@ -24,18 +24,51 @@ import urllib.request
 import zoneinfo
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE, "config.json")
-STATE_PATH = os.path.join(BASE, "state.json")
-LOG_PATH = os.path.join(BASE, "sentry.log")
+# SENTRY_DATA lets the container keep config/state/logs on a mounted volume
+# while the code stays read-only in the image
+DATA = os.environ.get("SENTRY_DATA") or BASE
+CONFIG_PATH = os.path.join(DATA, "config.json")
+STATE_PATH = os.path.join(DATA, "state.json")
+LOG_PATH = os.path.join(DATA, "sentry.log")
 
 UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 NAPI = "https://www.fandango.com/napi/theaterMovieShowtimes/{venue}?date={date}"
 
-CFG = json.load(open(CONFIG_PATH))
+def apply_env(cfg):
+    """Env wins over config.json. On a shared VPS this keeps the bot token
+    out of a file on disk — pass it through the orchestrator's secret store
+    instead."""
+    e = os.environ
+    tg = cfg.setdefault("channels", {}).setdefault("telegram", {})
+    if e.get("TELEGRAM_TOKEN"):
+        tg["token"] = e["TELEGRAM_TOKEN"]
+        tg["enabled"] = True
+    if e.get("TELEGRAM_CHAT_ID"):
+        tg["chat_id"] = e["TELEGRAM_CHAT_ID"]
+    if e.get("TELEGRAM_EXTRA_CHAT_IDS"):
+        tg["extra_chat_ids"] = [x.strip() for x
+                                in e["TELEGRAM_EXTRA_CHAT_IDS"].split(",")
+                                if x.strip()]
+    if e.get("NTFY_TOPIC"):
+        nt = cfg.setdefault("channels", {}).setdefault("ntfy", {})
+        nt["topic"] = e["NTFY_TOPIC"]
+        nt.setdefault("server", "https://ntfy.sh")
+        nt["enabled"] = True
+    if e.get("HEALTHCHECKS_URL"):
+        cfg["healthchecks_url"] = e["HEALTHCHECKS_URL"]
+    if e.get("TARGET_DATES"):
+        cfg["target_dates"] = [x.strip() for x in e["TARGET_DATES"].split(",")
+                               if x.strip()]
+    if e.get("SCHEDULE_TZ"):
+        cfg["schedule_tz"] = e["SCHEDULE_TZ"]
+    return cfg
 
 
-LOCK_PATH = os.path.join(BASE, ".sentry.lock")
+CFG = apply_env(json.load(open(CONFIG_PATH)))
+
+
+LOCK_PATH = os.path.join(DATA, ".sentry.lock")
 _LOCK_FH = None
 
 
@@ -158,9 +191,20 @@ def breaker_fail(st):
         b["openUntil"] = time.time() + backoff
         log(f"breaker OPEN for {backoff}s (failures={b['failures']})")
     if b["failures"] == 6 and not b["degradedSent"]:
-        push("Sentry degraded", "Fandango unreadable for several cycles; "
-             "backing off and retrying automatically.", priority="default",
-             tags="warning")
+        err = (st.get("lastFetch") or {}).get("error", "")
+        # a datacenter IP getting refused is the predicted failure when this
+        # runs off-laptop — name it instead of a generic "unreadable"
+        blocked = any(code in err for code in ("403", "429", "503"))
+        body = (f"Fandango refused {b['failures']} requests in a row "
+                f"({err[:120]}).\n") if err else \
+            "Fandango unreadable for several cycles.\n"
+        if blocked:
+            body += ("This looks like IP-level blocking — expected if the "
+                     "watcher is running from a datacenter/VPS address. "
+                     "Moving back to a residential IP is the fix.")
+        else:
+            body += "Backing off and retrying automatically."
+        push("Sentry degraded", body, priority="default", tags="warning")
         b["degradedSent"] = True
 
 
@@ -214,7 +258,7 @@ def fetch_day(st, venue, date):
         maybe_blind_alert(st)
     if CFG.get("capture_last_response"):
         try:
-            with open(os.path.join(BASE, "last_response.json"), "wb") as f:
+            with open(os.path.join(DATA, "last_response.json"), "wb") as f:
                 f.write(body)
         except Exception as e:
             log(f"response capture failed: {e}")
@@ -238,6 +282,11 @@ def maybe_blind_alert(st):
 
 
 def send_ntfy(ch, title, body, priority):
+    # an unconfigured channel must FAIL, never silently "succeed" — push()
+    # treats success as delivered and advances the horizon on the strength
+    # of it, so a blank topic would swallow a real drop alert
+    if not ch.get("topic") or not ch.get("server"):
+        raise RuntimeError("ntfy server/topic not configured")
     # JSON publish: title/message ride UTF-8 in the body — plain ntfy headers
     # are latin-1 only and reject em-dashes etc.
     levels = {"urgent": 5, "good": 4, "default": 3, "low": 2}
