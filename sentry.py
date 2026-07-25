@@ -281,7 +281,7 @@ def maybe_blind_alert(st):
         st["blindAlerted"] = True
 
 
-def send_ntfy(ch, title, body, priority):
+def send_ntfy(ch, title, body, priority, audience="all"):
     # an unconfigured channel must FAIL, never silently "succeed" — push()
     # treats success as delivered and advances the horizon on the strength
     # of it, so a blank topic would swallow a real drop alert
@@ -300,7 +300,7 @@ def send_ntfy(ch, title, body, priority):
     urllib.request.urlopen(req, timeout=15)
 
 
-def send_whatsapp(ch, title, body, priority):
+def send_whatsapp(ch, title, body, priority, audience="all"):
     # WhatsApp has no priority levels; encode urgency in the text itself.
     prefix = {"urgent": "🚨", "default": "⚠️", "good": "✅", "low": "✅"}[priority]
     text = f"{prefix} {title}\n{body}"
@@ -354,7 +354,7 @@ def _telegram_send_one(ch, chat_id, text, priority):
         raise RuntimeError(f"telegram API said: {resp}")
 
 
-def send_telegram(ch, title, body, priority):
+def send_telegram(ch, title, body, priority, audience="all"):
     if not (ch.get("token") and ch.get("chat_id")):
         raise RuntimeError("telegram token/chat_id not configured")
     # only housekeeping notes stay silent — a recovery ("good") must be as
@@ -365,6 +365,8 @@ def send_telegram(ch, title, body, priority):
     # subscriber channel) are best-effort so a friend's feed can't block
     # your own alert
     _telegram_send_one(ch, ch["chat_id"], text, priority)
+    if audience != "all":
+        return  # operational noise stays in your own chat
     for extra in ch.get("extra_chat_ids", []):
         try:
             _telegram_send_one(ch, extra, text, priority)
@@ -408,16 +410,22 @@ CHANNELS = {"whatsapp": send_whatsapp, "telegram": send_telegram,
             "ntfy": send_ntfy}
 
 
-def push(title, body, priority="urgent", tags=None):
+def push(title, body, priority="urgent", tags=None, audience="private"):
     """Fan out to every enabled channel. True if ANY channel delivered —
-    horizon/alert bookkeeping needs at least one copy to have reached you."""
+    horizon/alert bookkeeping needs at least one copy to have reached you.
+
+    audience="private" (the default, so anything new is quiet by mistake
+    rather than loud by mistake) reaches only your own chat. audience="all"
+    also broadcasts to subscriber channels — reserve it for the handful of
+    alerts a friend actually wants: a date going live, a drop, a seat
+    opening up. Nobody subscribed to hear that a launchd job restarted."""
     delivered = []
     for name, sender in CHANNELS.items():
         ch = CFG.get("channels", {}).get(name, {})
         if not ch.get("enabled"):
             continue
         try:
-            sender(ch, title, body, priority)
+            sender(ch, title, body, priority, audience)
             delivered.append(name)
         except Exception as e:
             log(f"PUSH FAILED via {name} ({e}): {title}")
@@ -487,6 +495,20 @@ def scan_dates(st, venue, dates):
     return found
 
 
+def pretty_date(iso):
+    """2026-08-21 -> 'Fri, Aug 21' — friends should not have to parse ISO."""
+    try:
+        return dt.date.fromisoformat(iso).strftime("%a, %b %-d")
+    except Exception:
+        return iso
+
+
+def pretty_time(t):
+    """Fandango's '7:00p' -> '7:00 PM'."""
+    m = re.match(r"(\d{1,2}:\d{2})([ap])$", t or "")
+    return f"{m.group(1)} {m.group(2).upper()}M" if m else t
+
+
 def fmt_dates(datelist):
     ds = sorted(datelist)
     a = dt.date.fromisoformat(ds[0]).strftime("%b %-d")
@@ -505,9 +527,10 @@ def maybe_instant_alert(st, venue, probe_date):
     if not CFG.get("instant_alert", True) or not announce_ok(st, probe_date):
         return
     vcfg = CFG["venues"][venue]
-    if push(f"70mm DROP detected — {vcfg['name']}",
-            f"New dates past {st['horizon'][venue]} just appeared. "
-            f"Details in ~1 min. Book now: {vcfg['link']}"):
+    if push(f"🎬 Odyssey 70mm — new dates dropping now",
+            f"New dates just appeared at {vcfg['name']}. Full list in about "
+            f"a minute — if you want in, start here now:\n{vcfg['link']}",
+            audience="all"):
         st["instantAlerted"][venue] = probe_date
 
 
@@ -558,21 +581,24 @@ def target_check(st, now):
             vcfg = CFG["venues"][venue]
             open_ = [h for h in slots if h["type"] == "available"]
             gone = [h for h in slots if h["type"] != "available"]
-            lines = [f"{date} is listed! ({vcfg['tz_label']}) "
-                     f"Tap to check the seat map — the feed's 'available' "
-                     f"means on-sale, NOT seats remaining."]
+            lines = [f"{pretty_date(date)} just went on sale at "
+                     f"{vcfg['name']} ({vcfg['tz_label']}).", ""]
             for h in open_:
-                lines.append(f"{h['time']} → "
-                             f"{h.get('url') or vcfg['link']}")
+                lines.append(f"🎟  {pretty_time(h['time'])} — tap to pick "
+                             f"seats:\n{h.get('url') or vcfg['link']}")
             if gone:
-                lines.append("flagged sold out: " +
-                             ", ".join(h["time"] for h in gone))
+                lines.append("Already sold out: " +
+                             ", ".join(pretty_time(h["time"]) for h in gone))
             if not open_:
-                lines.append(f"Watching for refunds. {vcfg['link']}")
+                lines.append("All evening shows are sold out already — "
+                             "we'll keep watching for returned seats.")
+            lines += ["", "Tip: a showtime can be listed and still have no "
+                      "seats left, so check the map before celebrating."]
             if vcfg.get("amc_link"):
-                lines.append(f"AMC side: {vcfg['amc_link'].format(date=date)}")
-            if push(f"70mm TARGET LIVE — {vcfg['name']}",
-                    "\n".join(lines)):
+                lines.append(f"Prefer the AMC app? "
+                             f"{vcfg['amc_link'].format(date=date)}")
+            if push(f"🎬 Odyssey 70mm — {pretty_date(date)} tickets are up",
+                    "\n".join(lines), audience="all"):
                 st["targetAlerted"].append(date)
                 mark_announced(st, [date])
                 if gone:
@@ -661,11 +687,14 @@ def restock_check(st, venue, dates):
                     freed.append((date, h["time"], h.get("url"), key))
     if freed:
         vcfg = CFG["venues"][venue]
-        lines = [f"Status flipped sold-out → on-sale ({vcfg['tz_label']}) — "
-                 f"tap to confirm real seats on the map:"]
+        lines = [f"A sold-out show at {vcfg['name']} just reopened "
+                 f"({vcfg['tz_label']}) — someone likely returned tickets. "
+                 f"These go fast:", ""]
         for date, t, url, _ in freed:
-            lines.append(f"{date} {t} → {url or vcfg['link']}")
-        if push(f"70mm RESTOCK — {vcfg['name']}", "\n".join(lines)):
+            lines.append(f"🎟  {pretty_date(date)}, {pretty_time(t)}\n"
+                         f"{url or vcfg['link']}")
+        if push(f"🎟️ Seats just opened — {vcfg['name']}",
+                "\n".join(lines), audience="all"):
             st["restockAlerted"].extend(k for *_, k in freed)
 
 
@@ -686,10 +715,15 @@ def handle_drop(st, venue, found):
     open_ = sum(c["open"] for c in new.values())
     seats = (f"{open_} with open seats" if open_ == total
              else f"{open_} with open seats, {total - open_} sold out")
-    body = (f"New IMAX 70mm dates at {vcfg['name']}: {fmt_dates(new)} "
-            f"({len(new)} dates, {total} showtimes — {seats}, "
-            f"{vcfg['tz_label']}). unconfirmed · per Fandango\n{vcfg['link']}")
-    if push(f"70mm DROP — {vcfg['name']}", body):
+    body = (f"{len(new)} new date{'s' if len(new) > 1 else ''} just went on "
+            f"sale at {vcfg['name']}: {fmt_dates(new)} "
+            f"({vcfg['tz_label']}).\n"
+            f"{total} showtimes — {seats}.\n\n"
+            f"Grab seats: {vcfg['link']}\n\n"
+            f"Tip: a showtime can be listed and still have no seats left, so "
+            f"check the map before celebrating.")
+    if push(f"🎬 Odyssey 70mm — new dates at {vcfg['name']}", body,
+            audience="all"):
         st["alerted"][venue].extend(sorted(new))
         mark_announced(st, new)
         st["dropLog"].append({"venue": venue,

@@ -324,7 +324,8 @@ class TestNotifier(SentryTest):
 
         with mock.patch.object(sentry.urllib.request, "urlopen",
                                side_effect=fake_urlopen):
-            self.assertTrue(sentry.push("DROP", "b", priority="urgent"))
+            self.assertTrue(sentry.push("DROP", "b", priority="urgent",
+                                        audience="all"))
         # primary first, then every extra despite the middle one failing
         self.assertEqual(seen, ["424242", "@odyssey70mm", "-100555"])
 
@@ -437,8 +438,9 @@ class TestRestock(SentryTest):
         p = self.run_check([showtime(type_="available", time_="6:00p",
                                      url="https://tickets.example/jump?y=2")])
         p.assert_called_once()
-        self.assertIn("RESTOCK", p.call_args.args[0])
-        self.assertIn("2026-08-15 6:00p → https://tickets.example/jump?y=2",
+        self.assertIn("Seats just opened", p.call_args.args[0])
+        self.assertIn("Sat, Aug 15, 6:00 PM", p.call_args.args[1])
+        self.assertIn("https://tickets.example/jump?y=2",
                       p.call_args.args[1])
 
     def test_available_to_soldout_updates_without_alert(self):
@@ -531,8 +533,8 @@ class TestTargetCheck(SentryTest):
     def test_evening_listing_rings_and_dedupes(self):
         f, p = self.run_target([showtime(time_="7:00p")])
         p.assert_called_once()
-        self.assertIn("TARGET LIVE", p.call_args.args[0])
-        self.assertIn("2026-08-21", p.call_args.args[1])
+        self.assertIn("Fri, Aug 21", p.call_args.args[0])
+        self.assertIn("7:00 PM", p.call_args.args[1])
         self.assertEqual(self.st["targetAlerted"], ["2026-08-21"])
         # already alerted → no further fetches
         f2, p2 = self.run_target([showtime(time_="7:00p")])
@@ -542,18 +544,19 @@ class TestTargetCheck(SentryTest):
         sentry.CFG["venues"]["AABQI"]["amc_link"] = \
             "https://amc.example/showtimes?date={date}"
         f, p = self.run_target([showtime(time_="7:00p")])
-        self.assertIn("AMC side: https://amc.example/showtimes"
-                      "?date=2026-08-21", p.call_args.args[1])
+        self.assertIn("https://amc.example/showtimes?date=2026-08-21",
+                      p.call_args.args[1])
 
     def test_open_slot_alert_carries_showtime_deep_link(self):
         f, p = self.run_target(
             [showtime(time_="7:00p", url="https://tickets.example/jump?x=1")])
-        self.assertIn("7:00p → https://tickets.example/jump?x=1",
+        self.assertIn("7:00 PM", p.call_args.args[1])
+        self.assertIn("https://tickets.example/jump?x=1",
                       p.call_args.args[1])
 
     def test_missing_deep_link_falls_back_to_venue_page(self):
         f, p = self.run_target([showtime(time_="7:00p")])
-        self.assertIn("7:00p → https://link.example/ls", p.call_args.args[1])
+        self.assertIn("https://link.example/ls", p.call_args.args[1])
 
     def test_soldout_evening_rings_and_arms_refund_sniper(self):
         f, p = self.run_target([showtime(time_="7:00p", type_="soldout")])
@@ -706,6 +709,81 @@ class TestScheduleTimezone(SentryTest):
         sentry.CFG["schedule_tz"] = "Not/AZone"
         self.assertEqual(
             sentry.poll_interval(dt.datetime(2026, 7, 29, 15, 0)), 60)
+
+
+class TestAudienceRouting(SentryTest):
+    """Friends subscribed to hear about tickets, not about launchd."""
+
+    def setUp(self):
+        super().setUp()
+        sentry.CFG["channels"]["whatsapp"]["enabled"] = False
+        sentry.CFG["channels"]["ntfy"]["enabled"] = False
+        tg = sentry.CFG["channels"]["telegram"]
+        tg["enabled"] = True
+        tg["extra_chat_ids"] = ["-100999"]
+
+    def recipients(self, **push_kw):
+        seen = []
+
+        def fake_urlopen(req, timeout=None):
+            seen.append(json.loads(req.data.decode())["chat_id"])
+            return FakeResp(b'{"ok": true}')
+
+        with mock.patch.object(sentry.urllib.request, "urlopen",
+                               side_effect=fake_urlopen):
+            sentry.push("t", "b", **push_kw)
+        return seen
+
+    def test_default_is_private_so_new_alerts_cannot_leak(self):
+        self.assertEqual(self.recipients(), ["424242"])
+
+    def test_operational_alert_never_reaches_the_channel(self):
+        self.assertEqual(self.recipients(audience="private"), ["424242"])
+
+    def test_ticket_alert_reaches_you_and_the_channel(self):
+        self.assertEqual(self.recipients(audience="all"),
+                         ["424242", "-100999"])
+
+    def test_watchdog_alerts_are_private(self):
+        import watchdog
+        src = open(watchdog.__file__).read()
+        # every push in the watchdog must stay out of the subscriber channel
+        self.assertNotIn('audience="all"', src)
+
+    def test_startup_check_alerts_are_private(self):
+        import startup_check
+        self.assertNotIn('audience="all"', open(startup_check.__file__).read())
+
+
+class TestFriendlyCopy(SentryTest):
+    def test_dates_and_times_are_human_readable(self):
+        self.assertEqual(sentry.pretty_date("2026-08-21"), "Fri, Aug 21")
+        self.assertEqual(sentry.pretty_time("7:00p"), "7:00 PM")
+        self.assertEqual(sentry.pretty_time("11:00a"), "11:00 AM")
+        self.assertEqual(sentry.pretty_date("garbage"), "garbage")
+        self.assertEqual(sentry.pretty_time("garbage"), "garbage")
+
+    def test_target_alert_has_no_iso_dates_or_jargon(self):
+        sentry.CFG["target_dates"] = ["2026-08-21"]
+        with mock.patch.object(sentry, "fetch_day",
+                               return_value=viewmodel([
+                                   showtime(time_="7:00p",
+                                            url="https://tix.example/x")])), \
+             mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.target_check(self.st, dt.datetime(2026, 8, 1, 12, 0))
+        title, body = p.call_args.args[0], p.call_args.args[1]
+        self.assertIn("Fri, Aug 21", title)
+        self.assertIn("7:00 PM", body)
+        self.assertNotIn("2026-08-21", body)
+        self.assertNotIn("TARGET LIVE", title)
+        self.assertEqual(p.call_args.kwargs["audience"], "all")
+
+    def test_drop_alert_is_broadcast_and_readable(self):
+        with mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.handle_drop(self.st, "AABQI",
+                               {"2026-08-20": {"total": 4, "open": 4}})
+        self.assertEqual(p.call_args.kwargs["audience"], "all")
+        self.assertNotIn("unconfirmed · per Fandango", p.call_args.args[1])
 
 
 class TestEnvOverrides(SentryTest):

@@ -55,6 +55,28 @@ Design doc (weak points W1–W6 enumerated): https://claude.ai/code/artifact/e57
   (3 strikes → open 30 min, exponential to 4 h cap, one degraded alert at 6).
 - **W5 guard:** weekly low-priority "Sentry alive" push proves the whole channel.
 
+## Who hears what
+
+`push(audience=...)` splits the two audiences. **`private`** is the default,
+so anything added later is quiet by mistake rather than loud by mistake:
+
+| Audience | Reaches | Alerts |
+|---|---|---|
+| `private` | your own chat + ntfy | SENTRY DOWN / BACK UP / BLIND, degraded, startup check, weekly self-test |
+| `all` | the above **plus** `extra_chat_ids` | a date going on sale, a drop, seats reopening |
+
+Subscribers signed up to hear about tickets, not about launchd. Operational
+messages carry hostnames, restart commands, and HTTP diagnostics — none of
+that belongs in a channel full of friends, so the subscriber broadcast is
+opt-in per alert and the watchdog and startup check never use it (pinned by
+test).
+
+Friend-facing copy is written for people who have never seen this repo:
+`pretty_date()` renders `2026-08-21` as `Fri, Aug 21` and `pretty_time()`
+renders `7:00p` as `7:00 PM`, each showtime gets its own tap-to-book line,
+and every ticket alert carries the caveat that a listed showtime can still
+have zero seats.
+
 ## One alert per date
 
 Three paths can reach the same date (the target watch, the probe's instant
@@ -202,7 +224,7 @@ To go WhatsApp-only, set `channels.ntfy.enabled: false`.
 cd ~/Developer/70mm-sentry && python3 -m unittest discover -s tests -v
 ```
 
-97 unit tests, all network mocked: 70mm detection (incl. soldout/restricted
+105 unit tests, all network mocked: 70mm detection (incl. soldout/restricted
 typing), drop handling (horizon advances only on delivered alerts; failed
 push retries), sweep cutoff, budget rollover/exhaustion, breaker
 open/half-open/recover + single degraded alert, notifier fan-out (one channel
