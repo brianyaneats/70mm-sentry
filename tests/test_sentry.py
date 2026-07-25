@@ -182,7 +182,8 @@ class TestScanDates(SentryTest):
                 sentry, "fetch_day",
                 side_effect=lambda st, v, d: viewmodel(data[d])):
             found = sentry.scan_dates(self.st, "AABQI", list(data))
-        self.assertEqual(found, {"d1": {"total": 2, "open": 1}})
+        self.assertEqual(found, {"d1": {"total": 2, "open": 1,
+                                        "times": ["6:00p"]}})
 
     def test_fetch_failure_returns_partial_and_trips_breaker(self):
         seq = {"d1": viewmodel([showtime()]), "d2": None}
@@ -1185,3 +1186,152 @@ class TestPreflight(SentryTest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDropAlertTimes(SentryTest):
+    def test_body_lists_per_date_showtimes(self):
+        found = {"2026-08-20": {"total": 2, "open": 2,
+                                "times": ["3:30p", "7:00p"]},
+                 "2026-08-21": {"total": 1, "open": 1, "times": ["6:00p"]}}
+        with mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.handle_drop(self.st, "AABQI", found)
+        body = p.call_args.args[1]
+        self.assertIn("Thu, Aug 20: 3:30 PM, 7:00 PM", body)
+        self.assertIn("Fri, Aug 21: 6:00 PM", body)
+
+    def test_caps_dates_and_times_so_a_big_drop_fits_one_push(self):
+        found = {f"2026-09-{d:02d}": {"total": 10, "open": 10,
+                                      "times": ["6:00p"] * 10}
+                 for d in range(1, 9)}  # 8 dates, 10 showtimes each
+        with mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.handle_drop(self.st, "AABQI", found)
+        body = p.call_args.args[1]
+        self.assertIn("(+2 more)", body)          # times capped at 8
+        self.assertIn("…and 2 more dates", body)  # dates capped at 6
+
+    def test_found_without_times_key_still_alerts(self):
+        found = {"2026-08-20": {"total": 2, "open": 2}}
+        with mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.handle_drop(self.st, "AABQI", found)
+        self.assertIn("2 showtimes", p.call_args.args[1])
+
+
+class TestHeartbeatPublish(SentryTest):
+    def setUp(self):
+        super().setUp()
+        sentry.CFG["heartbeat_topic"] = "hb-secret"
+        sentry.CFG["heartbeat_server"] = "https://ntfy.example"
+        sentry.CFG["instance_name"] = "mac"
+
+    def test_publishes_when_due_and_records_time(self):
+        with mock.patch.object(sentry.urllib.request, "urlopen") as u:
+            sentry.heartbeat(self.st)
+        u.assert_called_once()
+        payload = json.loads(u.call_args.args[0].data)
+        self.assertEqual(payload["topic"], "hb-secret")
+        self.assertEqual(payload["title"], "hb")
+        self.assertEqual(payload["priority"], 1)  # must never ring
+        self.assertIn("mac", payload["message"])
+        self.assertIn("lastHeartbeat", self.st)
+
+    def test_rate_limited_between_publishes(self):
+        self.st["lastHeartbeat"] = sentry.time.time()
+        with mock.patch.object(sentry.urllib.request, "urlopen") as u:
+            sentry.heartbeat(self.st)
+        u.assert_not_called()
+
+    def test_no_topic_means_no_publish(self):
+        sentry.CFG["heartbeat_topic"] = ""
+        with mock.patch.object(sentry.urllib.request, "urlopen") as u:
+            sentry.heartbeat(self.st)
+        u.assert_not_called()
+
+    def test_publish_failure_is_swallowed_and_retried_next_cycle(self):
+        with mock.patch.object(sentry.urllib.request, "urlopen",
+                               side_effect=OSError("boom")):
+            sentry.heartbeat(self.st)  # must not raise
+        self.assertNotIn("lastHeartbeat", self.st)
+
+    def test_healthchecks_url_still_pinged_alongside(self):
+        sentry.CFG["healthchecks_url"] = "https://hc.example/ping"
+        with mock.patch.object(sentry.urllib.request, "urlopen") as u:
+            sentry.heartbeat(self.st)
+        self.assertEqual(u.call_count, 2)
+
+
+class TestRotateLog(SentryTest):
+    def setUp(self):
+        super().setUp()
+        self.tmp = tempfile.mkdtemp()
+        sentry.CFG["log_max_bytes"] = 10
+
+    def test_rotates_both_logs_at_cap(self):
+        with open(sentry.LOG_PATH, "w") as f:
+            f.write("x" * 20)
+        launchd = os.path.join(self.tmp, "launchd.log")
+        with open(launchd, "w") as f:
+            f.write("x" * 20)
+        with mock.patch.object(sentry, "DATA", self.tmp):
+            sentry.rotate_log()
+        self.assertTrue(os.path.exists(sentry.LOG_PATH + ".1"))
+        self.assertFalse(os.path.exists(sentry.LOG_PATH))
+        self.assertTrue(os.path.exists(launchd + ".1"))
+        os.unlink(sentry.LOG_PATH + ".1")
+        open(sentry.LOG_PATH, "w").close()  # tearDown unlinks it
+
+    def test_under_cap_untouched(self):
+        with open(sentry.LOG_PATH, "w") as f:
+            f.write("x" * 5)
+        with mock.patch.object(sentry, "DATA", self.tmp):
+            sentry.rotate_log()
+        self.assertTrue(os.path.exists(sentry.LOG_PATH))
+        self.assertFalse(os.path.exists(sentry.LOG_PATH + ".1"))
+
+
+class TestSnapshotState(SentryTest):
+    def test_writes_daily_snapshot_and_prunes_old(self):
+        tmp = tempfile.mkdtemp()
+        state_path = os.path.join(tmp, "state.json")
+        snap_dir = os.path.join(tmp, "snapshots")
+        os.makedirs(snap_dir)
+        for d in ("2020-01-01", "2020-01-02", "2020-01-03"):
+            open(os.path.join(snap_dir, f"state-{d}.json"), "w").close()
+        with mock.patch.object(sentry, "STATE_PATH", state_path):
+            sentry.snapshot_state(self.st, keep=3)
+        snaps = sorted(os.listdir(snap_dir))
+        self.assertEqual(len(snaps), 3)
+        self.assertIn(f"state-{dt.date.today().isoformat()}.json", snaps)
+        self.assertNotIn("state-2020-01-01.json", snaps)
+        body = json.load(open(os.path.join(snap_dir, snaps[-1])))
+        self.assertEqual(body["horizon"], self.st["horizon"])
+
+    def test_failure_never_raises(self):
+        with mock.patch.object(sentry, "STATE_PATH", "/nonexistent/x/state"):
+            sentry.snapshot_state(self.st)  # must not raise
+
+
+class TestDailyDigest(SentryTest):
+    def test_content_covers_targets_horizon_and_health(self):
+        sentry.CFG["target_dates"] = ["2026-08-21", "2026-08-22"]
+        sentry.CFG["heartbeat_topic"] = "hb"
+        self.st["targetAlerted"] = ["2026-08-21"]
+        self.st["budgetYesterday"] = 123
+        body = sentry.build_digest(self.st)
+        self.assertIn("Waiting on: Sat, Aug 22", body)
+        self.assertIn("Already on sale: Fri, Aug 21", body)
+        self.assertIn("Lincoln Square schedule runs through", body)
+        self.assertIn("Yesterday: 123 requests", body)
+        self.assertIn("Off-box dead-man: armed.", body)
+
+    def test_first_day_has_no_yesterday_count(self):
+        body = sentry.build_digest(self.st)
+        self.assertIn("First day on this box", body)
+
+    def test_open_breaker_is_reported(self):
+        self.st["breaker"]["state"] = "open"
+        self.assertIn("breaker open", sentry.build_digest(self.st))
+
+    def test_budget_rollover_stashes_yesterday(self):
+        self.st["budget"] = {"date": "2001-01-01", "spent": 999}
+        sentry.budget_ok(self.st)
+        self.assertEqual(self.st["budgetYesterday"], 999)

@@ -273,8 +273,24 @@ state writes) — it backs the container `HEALTHCHECK`, leaving the
 entrypoint's watchdog loop as the single writer of alert state.
 
 Not covered on-box: the machine asleep or powered off takes the watchdog
-down too. Only an off-box dead-man's switch (`healthchecks_url`, pinged
-every cycle) closes that.
+down too. Two off-box dead-man's switches close that:
+
+- **GitHub Actions deadman** (`.github/workflows/deadman.yml`, active): the
+  sentry publishes a heartbeat to a secret ntfy topic (`heartbeat_topic`,
+  every `heartbeat_every_seconds`); an hourly Actions cron polls the topic
+  and Telegrams you if the newest heartbeat is >90 min old. Re-alerts are
+  suppressed for 6 h via a marker message on the same topic. No third-party
+  account needed — repo secrets `HEARTBEAT_TOPIC`, `TELEGRAM_TOKEN`,
+  `TELEGRAM_CHAT_ID`. Caveats: GitHub cron can lag minutes, and scheduled
+  workflows pause after 60 days without repo activity.
+- **healthchecks.io** (`healthchecks_url`, optional alternative): pinged
+  every cycle if set; tighter grace periods, but requires an account.
+
+A **daily digest** (`daily_digest_hour`, theater time; silent priority)
+summarizes each morning: target dates still waited on, how far the listed
+schedule runs, refund watches, yesterday's request count, breaker state.
+Its *absence* is itself a liveness signal you'll notice with your coffee.
+Preview without pushing: `python3 sentry.py --digest-preview`.
 
 ## Notification layer
 
@@ -427,10 +443,12 @@ To simulate a drop for testing: set a venue's `horizon` back a week and run with
 ## Knobs (config.json)
 
 `sweep_days`, `daily_request_budget`, `quiet_*_hour`, `reconcile_days`,
-`self_test_every_days`, `ntfy_topic`, and `healthchecks_url` — set the last one
-to a healthchecks.io ping URL to get dead-man alerts if the sentry itself dies
-(strongly recommended; free tier is fine — the watcher pings it every cycle,
-and silence beyond your grace period alerts you).
+`self_test_every_days`, `log_max_bytes` (rotates `sentry.log` and
+`launchd.log`), `instance_name` (suffix on ops-alert titles),
+`daily_digest_hour` (silent morning digest, theater time; omit to disable),
+`heartbeat_topic` + `heartbeat_every_seconds` (feeds the GitHub Actions
+deadman — generate a long random topic, it is a credential), and
+`healthchecks_url` (optional second dead-man).
 
 ## Known limits (accepted trade-offs)
 

@@ -70,5 +70,9 @@
   "reconcile_days": 21,
   "quiet_start_hour": 23,
   "quiet_end_hour": 7,
-  "self_test_every_days": 7
+  "self_test_every_days": 7,
+  "instance_name": "mac",
+  "heartbeat_topic": "",
+  "heartbeat_every_seconds": 300,
+  "daily_digest_hour": 8
 }

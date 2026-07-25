@@ -93,16 +93,18 @@ def acquire_lock():
 
 
 def rotate_log():
-    """Keep sentry.log bounded — 30s polling writes ~8 MB/month."""
+    """Keep the logs bounded — 30s polling writes ~8 MB/month, and launchd
+    mirrors every stdout line into launchd.log, doubling it."""
     cap = CFG.get("log_max_bytes", 5_000_000)
-    try:
-        if os.path.getsize(LOG_PATH) < cap:
-            return
-        os.replace(LOG_PATH, LOG_PATH + ".1")
-    except FileNotFoundError:
-        pass
-    except Exception:
-        pass
+    for path in (LOG_PATH, os.path.join(DATA, "launchd.log")):
+        try:
+            if os.path.getsize(path) < cap:
+                continue
+            os.replace(path, path + ".1")
+        except FileNotFoundError:
+            pass
+        except Exception:
+            pass
 
 
 def log(msg):
@@ -190,6 +192,8 @@ def snapshot_state(st, keep=7):
 def budget_ok(st, n=1):
     today = dt.date.today().isoformat()
     if st["budget"]["date"] != today:
+        # yesterday's total feeds the morning digest before it's overwritten
+        st["budgetYesterday"] = st["budget"]["spent"]
         st["budget"] = {"date": today, "spent": 0}
     return st["budget"]["spent"] + n <= CFG["daily_request_budget"]
 
@@ -473,14 +477,37 @@ def push(title, body, priority="urgent", tags=None, audience="private"):
     return False
 
 
-def heartbeat():
+def heartbeat(st=None):
+    """Off-box liveness. healthchecks.io if configured, plus a heartbeat
+    published to a secret ntfy topic that the repo's GitHub Actions deadman
+    workflow polls — silence there means the whole Mac is asleep/off, the one
+    failure no local layer (launchd, watchdog, startup check) can report."""
     hc = CFG.get("healthchecks_url")
-    if not hc:
+    if hc:
+        try:
+            urllib.request.urlopen(hc, timeout=10)
+        except Exception as e:
+            log(f"heartbeat ping failed: {e}")
+    topic = CFG.get("heartbeat_topic")
+    if not topic or st is None:
+        return
+    last = st.get("lastHeartbeat") or 0
+    if time.time() - last < CFG.get("heartbeat_every_seconds", 300):
         return
     try:
-        urllib.request.urlopen(hc, timeout=10)
+        payload = json.dumps({
+            "topic": topic, "title": "hb",
+            "message": f"{CFG.get('instance_name', '?')} "
+                       f"{dt.datetime.now().isoformat(timespec='seconds')}",
+            # min priority: nothing subscribed to this topic should ever ring
+            "priority": 1}).encode()
+        req = urllib.request.Request(
+            CFG.get("heartbeat_server", "https://ntfy.sh"), data=payload,
+            headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+        st["lastHeartbeat"] = time.time()
     except Exception as e:
-        log(f"heartbeat ping failed: {e}")
+        log(f"heartbeat publish failed: {e}")
 
 
 # ---------- detection ----------
@@ -523,7 +550,9 @@ def scan_dates(st, venue, dates):
         if hits:
             found[d] = {"total": len(hits),
                         "open": sum(1 for h in hits
-                                    if h["type"] == "available")}
+                                    if h["type"] == "available"),
+                        "times": [h["time"] for h in hits
+                                  if h["type"] == "available"]}
             empties = 0
         else:
             empties += 1
@@ -735,6 +764,38 @@ def restock_check(st, venue, dates):
             st["restockAlerted"].extend(k for *_, k in freed)
 
 
+def build_digest(st):
+    """Morning one-pager: what's being watched, what came of it. Silent by
+    design — it informs without waking anyone; its absence is itself signal."""
+    lines = []
+    targets = CFG.get("target_dates") or []
+    if targets:
+        live = [d for d in targets if d in st.get("targetAlerted", [])]
+        wait = [d for d in targets if d not in live]
+        if wait:
+            lines.append("Waiting on: " +
+                         ", ".join(pretty_date(d) for d in wait))
+        if live:
+            lines.append("Already on sale: " +
+                         ", ".join(pretty_date(d) for d in live))
+    for v, vcfg in CFG["venues"].items():
+        lines.append(f"{vcfg['name']} schedule runs through "
+                     f"{pretty_date(st['horizon'][v])}.")
+    watch = restock_watchlist(st)
+    if watch:
+        lines.append("Refund watch: " +
+                     ", ".join(pretty_date(d) for d in watch))
+    spent = st.get("budgetYesterday")
+    health = (f"Yesterday: {spent} requests" if spent is not None
+              else "First day on this box")
+    if st["breaker"]["state"] != "closed":
+        health += f" · breaker {st['breaker']['state']}"
+    lines.append(health + ".")
+    if CFG.get("heartbeat_topic"):
+        lines.append("Off-box dead-man: armed.")
+    return "\n".join(lines)
+
+
 def handle_drop(st, venue, found):
     vcfg = CFG["venues"][venue]
     new = {d: c for d, c in found.items()
@@ -752,10 +813,22 @@ def handle_drop(st, venue, found):
     open_ = sum(c["open"] for c in new.values())
     seats = (f"{open_} with open seats" if open_ == total
              else f"{open_} with open seats, {total - open_} sold out")
+    # per-date showtime lines, capped so a big drop still fits one push
+    day_lines = []
+    for d in sorted(new)[:6]:
+        times = new[d].get("times") or []
+        if times:
+            shown = ", ".join(pretty_time(x) for x in times[:8])
+            extra = f" (+{len(times) - 8} more)" if len(times) > 8 else ""
+            day_lines.append(f"{pretty_date(d)}: {shown}{extra}")
+    if len(new) > 6:
+        day_lines.append(f"…and {len(new) - 6} more dates")
+    detail = ("\n".join(day_lines) + "\n\n") if day_lines else ""
     body = (f"{len(new)} new date{'s' if len(new) > 1 else ''} just went on "
             f"sale at {vcfg['name']}: {fmt_dates(new)} "
             f"({vcfg['tz_label']}).\n"
             f"{total} showtimes — {seats}.\n\n"
+            f"{detail}"
             f"Grab seats: {vcfg['link']}\n\n"
             f"Tip: a showtime can be listed and still have no seats left, so "
             f"check the map before celebrating.")
@@ -787,7 +860,7 @@ def main():
     if not fast:
         time.sleep(random.uniform(0, 5))  # jitter so runs never look metronomic
 
-    # cadence gate: launchd fires every 20s; run only when the current
+    # cadence gate: launchd fires every 10s; run only when the current
     # tier's interval (burst / base / overnight) has elapsed. The 0.9
     # tolerates launchd scheduling drift.
     if not fast and st["lastPollAt"]:
@@ -820,6 +893,13 @@ def main():
         if push("Sentry alive", f"Weekly self-test. Horizons — {h}",
                 priority="low", tags="white_check_mark"):
             st["lastSelfTest"] = today
+
+    # daily digest: one silent morning note, gated on the theater's clock
+    dh = CFG.get("daily_digest_hour")
+    if (dh is not None and st.get("lastDigest") != today
+            and schedule_time(now).hour >= dh):
+        if push("Sentry daily digest", build_digest(st), priority="low"):
+            st["lastDigest"] = today
 
     # daily reconcile: catches non-contiguous adds the probe can't see (W4)
     if st["lastReconcile"] != today and now.hour >= 6:
@@ -862,7 +942,7 @@ def main():
             d: t for d, t in st["restockLastPoll"].items() if d >= today}
         st["targetLastPoll"] = {
             d: t for d, t in st["targetLastPoll"].items() if d >= today}
-        heartbeat()
+        heartbeat(st)
         save_state(st)
         snapshot_state(st)
         log(f"reconcile done (budget spent today: {st['budget']['spent']})")
@@ -887,7 +967,9 @@ def main():
             hits = odyssey_70mm(vm)
             found.setdefault(probe_date, {
                 "total": len(hits),
-                "open": sum(1 for h in hits if h["type"] == "available")})
+                "open": sum(1 for h in hits if h["type"] == "available"),
+                "times": [h["time"] for h in hits
+                          if h["type"] == "available"]})
             handle_drop(st, venue, found)
         else:
             lf = st.get("lastFetch", {})
@@ -908,7 +990,7 @@ def main():
         for d in due:
             st["restockLastPoll"][d] = now.isoformat()
 
-    heartbeat()
+    heartbeat(st)
     save_state(st)
 
 
@@ -933,6 +1015,13 @@ def status():
     print(f"alerted:      {st.get('targetAlerted') or '(none)'}")
     print(f"restock watch:{restock_watchlist(st) or ' (none)'}")
     print(f"healthchecks: {CFG.get('healthchecks_url') or '(NOT SET)'}")
+    hb = st.get("lastHeartbeat")
+    hb_age = "never" if not hb else f"last hb {int(time.time() - hb)}s ago"
+    print(f"deadman:      "
+          f"{'armed, ' + hb_age if CFG.get('heartbeat_topic') else '(NOT SET)'}")
+    print(f"digest:       "
+          f"{CFG.get('daily_digest_hour', '(off)')} (last: "
+          f"{st.get('lastDigest') or 'never'})")
     print(f"instance:     {CFG.get('instance_name') or '(unnamed)'}")
     return 0
 
@@ -956,6 +1045,9 @@ if __name__ == "__main__":
         sys.exit(telegram_setup())
     if "--startup-push" in sys.argv:
         sys.exit(startup_push())
+    if "--digest-preview" in sys.argv:  # print only — never pushes
+        print(build_digest(load_state()))
+        sys.exit(0)
     if "--test-push" in sys.argv:
         ok = push("Sentry channel test",
                   "If you can read this, the notification layer reaches you.",
