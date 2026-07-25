@@ -63,3 +63,8 @@ jobs:
           curl -fsS --max-time 30 -H "Content-Type: application/json" \
             -d "{\"topic\":\"${HB_TOPIC}\",\"title\":\"deadman-alerted\",\"message\":\"alert sent $(date -u +%FT%TZ)\",\"priority\":1}" \
             https://ntfy.sh > /dev/null
+
+# NOTE: if the schedule ever stops firing (GitHub pauses cron after 60 days
+# of repo inactivity, and fresh schedules may need a push to register),
+# any commit to the default branch re-arms it. Manual check:
+#   gh workflow run deadman.yml --repo brianyaneats/70mm-sentry
