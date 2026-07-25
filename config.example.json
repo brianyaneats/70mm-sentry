@@ -1,0 +1,75 @@
+{
+  "channels": {
+    "whatsapp": {
+      "enabled": false,
+      "provider": "callmebot",
+      "phone": "",
+      "apikey": "",
+      "meta": {
+        "token": "",
+        "phone_number_id": "",
+        "to": "",
+        "template": ""
+      }
+    },
+    "telegram": {
+      "enabled": false,
+      "token": "",
+      "chat_id": "",
+      "extra_chat_ids": []
+    },
+    "ntfy": {
+      "enabled": true,
+      "server": "https://ntfy.sh",
+      "topic": "CHANGE-ME-random-secret-topic"
+    }
+  },
+  "healthchecks_url": "",
+  "blind_streak_alert": 20,
+  "capture_last_response": true,
+  "watchdog_stale_seconds": 600,
+  "watchdog_renotify_hours": 6,
+  "movie_match": "odyssey",
+  "format_match": "70MM",
+  "venues": {
+    "AABQI": {
+      "name": "Lincoln Square",
+      "referer": "https://www.fandango.com/amc-lincoln-square-13-aabqi/theater-page",
+      "link": "https://www.fandango.com/amc-lincoln-square-13-aabqi/theater-page?format=IMAX+70MM",
+      "amc_link": "https://www.amctheatres.com/movie-theatres/new-york-city/amc-lincoln-square-13/showtimes?date={date}",
+      "tz_label": "ET"
+    }
+  },
+  "target_dates": [
+    "2026-08-21",
+    "2026-08-22",
+    "2026-08-26"
+  ],
+  "target_after_hour": 18,
+  "target_every_seconds": 30,
+  "restock_watch_dates": [],
+  "restock_every_seconds": 300,
+  "restock_burst_seconds": 60,
+  "burst_windows": [
+    {
+      "days": [
+        "Tue",
+        "Wed"
+      ],
+      "start_hour": 9,
+      "end_hour": 18
+    }
+  ],
+  "burst_interval_seconds": 30,
+  "base_interval_seconds": 30,
+  "overnight_interval_seconds": 30,
+  "seed_horizon": "2026-08-19",
+  "sweep_days": 14,
+  "sweep_stop_after_empty": 3,
+  "sweep_spacing_seconds": 4,
+  "daily_request_budget": 15000,
+  "reconcile_days": 21,
+  "quiet_start_hour": 23,
+  "quiet_end_hour": 7,
+  "self_test_every_days": 7
+}
