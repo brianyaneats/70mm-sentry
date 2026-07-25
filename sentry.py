@@ -240,9 +240,9 @@ def maybe_blind_alert(st):
 def send_ntfy(ch, title, body, priority):
     # JSON publish: title/message ride UTF-8 in the body — plain ntfy headers
     # are latin-1 only and reject em-dashes etc.
-    levels = {"urgent": 5, "default": 3, "low": 2}
+    levels = {"urgent": 5, "good": 4, "default": 3, "low": 2}
     tags = {"urgent": "rotating_light", "default": "warning",
-            "low": "white_check_mark"}
+            "good": "white_check_mark", "low": "white_check_mark"}
     payload = json.dumps({"topic": ch["topic"], "title": title,
                           "message": body, "priority": levels[priority],
                           "tags": [tags[priority]]}).encode()
@@ -253,7 +253,7 @@ def send_ntfy(ch, title, body, priority):
 
 def send_whatsapp(ch, title, body, priority):
     # WhatsApp has no priority levels; encode urgency in the text itself.
-    prefix = {"urgent": "🚨", "default": "⚠️", "low": "✅"}[priority]
+    prefix = {"urgent": "🚨", "default": "⚠️", "good": "✅", "low": "✅"}[priority]
     text = f"{prefix} {title}\n{body}"
     if ch["provider"] == "callmebot":
         if not (ch.get("phone") and ch.get("apikey")):
@@ -308,7 +308,9 @@ def _telegram_send_one(ch, chat_id, text, priority):
 def send_telegram(ch, title, body, priority):
     if not (ch.get("token") and ch.get("chat_id")):
         raise RuntimeError("telegram token/chat_id not configured")
-    prefix = {"urgent": "🚨", "default": "⚠️", "low": "✅"}[priority]
+    # only housekeeping notes stay silent — a recovery ("good") must be as
+    # audible as the outage it clears, or the all-clear is never seen
+    prefix = {"urgent": "🚨", "default": "⚠️", "good": "✅", "low": "✅"}[priority]
     text = f"{prefix} {title}\n{body}"
     # primary chat failing fails the channel; broadcast extras (e.g. a
     # subscriber channel) are best-effort so a friend's feed can't block

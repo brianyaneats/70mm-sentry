@@ -111,17 +111,34 @@ def check(now=None):
                     f"com.brianyan.70mm-sentry"
             if sentry.push("SENTRY DOWN", body, priority="urgent"):
                 wd["lastAlertAt"] = now.isoformat()
+                # only an outage you were TOLD about earns an all-clear
+                wd["notified"] = True
+        if not wd.get("down"):
+            wd["downSince"] = now.isoformat()
         wd["down"] = True
         log(f"DOWN (age={age})")
     else:
-        if wd.get("down"):
-            sentry.push("Sentry recovered",
-                        f"Watcher is polling again "
-                        f"(last cycle {int(age)}s ago).",
-                        priority="low")
-            log("RECOVERED")
+        if wd.get("down") and wd.get("notified"):
+            since = wd.get("downSince")
+            for_ = ""
+            if since:
+                mins = int((now - dt.datetime.fromisoformat(since))
+                           .total_seconds() // 60)
+                for_ = f" after {mins} min down" if mins else " after <1 min"
+            if sentry.push("SENTRY BACK UP",
+                           f"Watcher is polling again{for_} "
+                           f"(last cycle {int(age)}s ago). "
+                           f"Alerts are live again.",
+                           priority="good"):
+                wd["notified"] = False
+                log("RECOVERED")
+            else:
+                # keep the flags so the all-clear retries next pass
+                save_wd_state(wd)
+                return 0
         wd["down"] = False
         wd["lastAlertAt"] = None
+        wd["downSince"] = None
 
     save_wd_state(wd)
     return 0 if not down else 1

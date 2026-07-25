@@ -81,15 +81,50 @@ class TestLiveness(WatchdogTest):
         rc, p = self.run_check()
         p.assert_called_once()  # not deduped, since nothing was delivered
 
-    def test_recovery_sends_low_priority_note(self):
+    def go_down_then_up(self, down_min=25, up_at=None):
+        self.write_state((NOW - dt.timedelta(minutes=down_min)).isoformat())
+        self.run_check()
+        up_at = up_at or NOW
+        # the watcher polled just before we looked, so it reads as alive
+        self.write_state((up_at - dt.timedelta(seconds=20)).isoformat())
+        with mock.patch.object(sentry, "push", return_value=True) as p:
+            rc = watchdog.check(up_at)
+        return rc, p
+
+    def test_recovery_alert_is_audible_not_silent(self):
+        """A silent all-clear defeats the point — it must ring like the
+        outage did."""
+        rc, p = self.go_down_then_up()
+        self.assertEqual(rc, 0)
+        p.assert_called_once()
+        self.assertEqual(p.call_args.args[0], "SENTRY BACK UP")
+        self.assertEqual(p.call_args.kwargs["priority"], "good")
+        self.assertNotEqual(p.call_args.kwargs["priority"], "low")
+
+    def test_recovery_reports_how_long_it_was_down(self):
+        rc, p = self.go_down_then_up(up_at=NOW + dt.timedelta(minutes=18))
+        self.assertIn("18 min down", p.call_args.args[1])
+
+    def test_no_all_clear_for_an_outage_you_were_never_told_about(self):
+        self.write_state((NOW - dt.timedelta(minutes=25)).isoformat())
+        self.run_check(push_ok=False)          # DOWN alert never delivered
+        self.write_state((NOW - dt.timedelta(seconds=20)).isoformat())
+        rc, p = self.run_check()
+        p.assert_not_called()
+
+    def test_failed_all_clear_retries_next_pass(self):
         self.write_state((NOW - dt.timedelta(minutes=25)).isoformat())
         self.run_check()
         self.write_state((NOW - dt.timedelta(seconds=20)).isoformat())
-        rc, p = self.run_check()
-        self.assertEqual(rc, 0)
+        self.run_check(push_ok=False)          # all-clear lost
+        rc, p = self.run_check()               # still owed one
         p.assert_called_once()
-        self.assertEqual(p.call_args.args[0], "Sentry recovered")
-        self.assertEqual(p.call_args.kwargs["priority"], "low")
+        self.assertEqual(p.call_args.args[0], "SENTRY BACK UP")
+
+    def test_recovery_fires_once_not_every_pass(self):
+        self.go_down_then_up()
+        rc, p = self.run_check()
+        p.assert_not_called()
 
 
 class TestErrorCapture(WatchdogTest):
