@@ -30,7 +30,7 @@
   "capture_last_response": true,
   "watchdog_stale_seconds": 600,
   "watchdog_renotify_hours": 6,
-  "movie_match": "odyssey",
+  "movie_match": "the odyssey",
   "format_match": "70MM",
   "venues": {
     "AABQI": {
@@ -74,5 +74,8 @@
   "instance_name": "mac",
   "heartbeat_topic": "",
   "heartbeat_every_seconds": 300,
-  "daily_digest_hour": 8
+  "daily_digest_hour": 8,
+  "movie_exclude": [
+    "space odyssey"
+  ]
 }

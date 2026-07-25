@@ -7,6 +7,24 @@ timer: launchd on a Mac, or the Docker entrypoint on a VPS.
 
 Design doc (weak points W1–W6 enumerated): https://claude.ai/code/artifact/e5799536-012f-494f-83bd-5f90044c32b5
 
+## Quickstart (Mac, ~5 minutes)
+
+```bash
+git clone git@github.com:brianyaneats/70mm-sentry.git ~/Developer/70mm-sentry
+cd ~/Developer/70mm-sentry
+cp config.example.json config.json
+# 1. Telegram: message @BotFather → /newbot → paste the token into
+#    config.json → channels.telegram.token, then DM your new bot anything.
+python3 sentry.py --telegram-setup   # discovers your chat_id, test-sends
+python3 sentry.py --test-push        # proves the notification layer
+./launchd/install.sh                 # installs + starts the three jobs
+python3 sentry.py --status           # "last cycle: Ns ago" = you're live
+```
+
+Optional but recommended: set `heartbeat_topic` to a long random secret and
+add `HEARTBEAT_TOPIC`/`TELEGRAM_TOKEN`/`TELEGRAM_CHAT_ID` as repo Actions
+secrets to arm the off-box dead-man (see Observability).
+
 ## How it works
 
 - **Source:** Fandango's NAPI (`fandango.com/napi/theaterMovieShowtimes/{id}?date=`).
@@ -404,7 +422,8 @@ healthy, urgent **SENTRY DID NOT COME BACK** when not. The live poll is
 retried 5× at 15 s intervals because Wi-Fi is usually not up yet at login,
 and an alert that cried wolf every boot would train you to ignore it.
 
-The plists are not versioned here — they carry absolute paths. Each is a
+The plists are generated from `launchd/*.plist.template` by
+`./launchd/install.sh` (idempotent — rerun after moving the repo). Each is a
 `ProgramArguments` shell wrapper that picks the first working interpreter
 (`/opt/homebrew/bin/python3`, then `/usr/bin/python3`, …) rather than
 hardcoding one, so an interpreter break cannot take down the watcher and its

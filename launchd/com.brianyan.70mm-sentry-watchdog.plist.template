@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.brianyan.70mm-sentry-watchdog</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>for p in /opt/homebrew/bin/python3 /usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3.12; do "$p" -c pass 2>/dev/null &amp;&amp; exec "$p" __REPO__/watchdog.py; done; echo "watchdog: no working python3 found"; exit 1</string>
+  </array>
+  <key>StartInterval</key><integer>300</integer>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>__REPO__/watchdog.log</string>
+  <key>StandardErrorPath</key><string>__REPO__/watchdog.log</string>
+</dict>
+</plist>

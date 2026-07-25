@@ -5,6 +5,10 @@ name: deadman
 # layer (launchd, watchdog, startup check) dies with the Mac — this is the
 # only alarm that survives the machine being asleep, off, or offline.
 #
+# Failure attribution matters: "can't reach ntfy from the runner" is NOT
+# "the Mac is down" — that case sends an accurate, silent note instead of
+# the loud Mac-down alarm (which would cry wolf on every ntfy blip).
+#
 # Caveats (accepted): GitHub cron can lag minutes under load; scheduled
 # workflows pause after 60 days without repo activity; ntfy.sh retains
 # messages ~12h (the alert-dedup marker relies on that).
@@ -28,12 +32,38 @@ jobs:
           STALE_AFTER_MIN: "90"
           REALERT_AFTER_MIN: "360"
         run: |
-          set -euo pipefail
+          set -uo pipefail
           now=$(date +%s)
-          msgs=$(curl -fsS --max-time 30 "https://ntfy.sh/${HB_TOPIC}/json?poll=1&since=13h" || true)
 
-          last_hb=$(printf '%s' "$msgs" | jq -rs '[.[] | select(.event=="message" and .title=="hb") | .time] | max // 0')
-          last_alert=$(printf '%s' "$msgs" | jq -rs '[.[] | select(.event=="message" and .title=="deadman-alerted") | .time] | max // 0')
+          tg() {  # $1 = text, $2 = "silent" for disable_notification
+            curl -fsS --max-time 30 \
+              "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+              -d chat_id="${TG_CHAT}" \
+              -d disable_notification=$([ "${2:-}" = silent ] && echo true || echo false) \
+              --data-urlencode text="$1" > /dev/null
+          }
+
+          msgs=""; reached=0
+          for i in 1 2 3; do
+            if msgs=$(curl -fsS --max-time 30 "https://ntfy.sh/${HB_TOPIC}/json?poll=1&since=13h"); then
+              reached=1; break
+            fi
+            sleep 20
+          done
+          if [ "$reached" -ne 1 ]; then
+            echo "ntfy unreachable after 3 attempts; no verdict this hour"
+            tg "✅ deadman note (silent): ntfy.sh unreachable from GitHub 3x — no heartbeat verdict this hour. This is NOT a Mac-down alarm; it self-retries next hour." silent || true
+            exit 0
+          fi
+
+          if ! last_hb=$(printf '%s' "$msgs" | jq -rs '[.[] | select(.event=="message" and .title=="hb") | .time] | max // 0' 2>/dev/null) \
+             || ! [[ "$last_hb" =~ ^[0-9]+$ ]]; then
+            echo "ntfy response unparseable; no verdict this hour"
+            tg "✅ deadman note (silent): ntfy returned unparseable data — no heartbeat verdict this hour. Not a Mac-down alarm; self-retries next hour." silent || true
+            exit 0
+          fi
+          last_alert=$(printf '%s' "$msgs" | jq -rs '[.[] | select(.event=="message" and .title=="deadman-alerted") | .time] | max // 0' 2>/dev/null) || last_alert=0
+          [[ "$last_alert" =~ ^[0-9]+$ ]] || last_alert=0
 
           hb_age_min=$(( (now - last_hb) / 60 ))
           if [ "$last_hb" -gt 0 ] && [ "$hb_age_min" -lt "$STALE_AFTER_MIN" ]; then
@@ -48,21 +78,18 @@ jobs:
           fi
 
           if [ "$last_hb" -eq 0 ]; then
-            desc="No heartbeat seen in the last 13h"
+            desc="ntfy is reachable but shows no heartbeat in the last 13h"
           else
             desc="Last heartbeat ${hb_age_min} min ago"
           fi
-          text="🚨 OFF-BOX ALARM — 70mm Sentry heartbeat is stale.
+          tg "🚨 OFF-BOX ALARM — 70mm Sentry heartbeat is stale.
           ${desc}. The Mac is likely asleep, off, or offline — you are NOT being watched for drops right now.
           Wake the Mac, then expect 'Sentry armed at startup'. (checked from GitHub Actions)"
-
-          curl -fsS --max-time 30 "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
-            -d chat_id="${TG_CHAT}" --data-urlencode text="$text" > /dev/null
-          echo "alerted via telegram"
+          echo "alerted via telegram (hb age ${hb_age_min}m)"
 
           curl -fsS --max-time 30 -H "Content-Type: application/json" \
             -d "{\"topic\":\"${HB_TOPIC}\",\"title\":\"deadman-alerted\",\"message\":\"alert sent $(date -u +%FT%TZ)\",\"priority\":1}" \
-            https://ntfy.sh > /dev/null
+            https://ntfy.sh > /dev/null || true
 
 # NOTE: if the schedule ever stops firing (GitHub pauses cron after 60 days
 # of repo inactivity, and fresh schedules may need a push to register),

@@ -107,6 +107,19 @@ def rotate_log():
             pass
 
 
+def elapsed_seconds(now, iso):
+    """Seconds between an isoformat timestamp and now, DST-safe. Accepts
+    naive (legacy state, interpreted as host-local) or aware values on
+    either side — plain wall-clock subtraction miscounts by an hour twice
+    a year, enough to false-trip staleness math or suppress a poll."""
+    t = dt.datetime.fromisoformat(iso)
+    if t.tzinfo is None:
+        t = t.astimezone()
+    if now.tzinfo is None:
+        now = now.astimezone()
+    return (now - t).total_seconds()
+
+
 def log(msg):
     line = f"{dt.datetime.now().isoformat(timespec='seconds')} {msg}"
     print(line)
@@ -252,11 +265,25 @@ def breaker_success(st):
 
 # ---------- http ----------
 
+# sentinel: budget exhaustion is self-imposed, not a Fandango failure — it
+# must never trip the breaker or masquerade as IP blocking in alerts
+BUDGET = object()
+
+
 def fetch_day(st, venue, date):
-    """One NAPI request. Returns viewModel dict or None (failure)."""
+    """One NAPI request. Returns viewModel dict, None (failure), or BUDGET
+    (self-imposed daily cap reached — not a failure)."""
     if not budget_ok(st):
+        today = dt.date.today().isoformat()
+        if st.get("budgetAlerted") != today:
+            if push("Sentry budget exhausted",
+                    f"Daily request budget ({CFG['daily_request_budget']}) "
+                    f"spent; polling pauses until midnight. If a drop is "
+                    f"expected, raise daily_request_budget.",
+                    priority="default"):
+                st["budgetAlerted"] = today
         log("daily request budget exhausted; skipping fetch")
-        return None
+        return BUDGET
     url = NAPI.format(venue=venue, date=date)
     req = urllib.request.Request(url, headers={
         "User-Agent": UA,
@@ -285,6 +312,7 @@ def fetch_day(st, venue, date):
     # the endpoint changed, is soft-failing, or is rejecting us politely
     if movies:
         st["blindStreak"] = 0
+        st["blindAlerted"] = False  # re-arm: blindness can recur
     else:
         st["blindStreak"] = st.get("blindStreak", 0) + 1
         log(f"SUSPECT {venue} {date}: HTTP {status}, {len(body)}B, "
@@ -408,9 +436,11 @@ def send_telegram(ch, title, body, priority, audience="all"):
             log(f"telegram broadcast to {extra} failed: {e}")
 
 
-def telegram_setup():
+def telegram_setup(pick=None):
     """One-time helper: after you message your new bot once, this discovers
-    your chat_id from getUpdates, saves it to config.json, and test-sends."""
+    your chat_id from getUpdates, saves it to config.json, and test-sends.
+    If several people have messaged the bot, refuses to guess — rerun with
+    the intended chat id as an argument."""
     ch = CFG["channels"]["telegram"]
     if not ch.get("token"):
         print("Put your BotFather token in config.json → channels.telegram."
@@ -426,7 +456,27 @@ def telegram_setup():
         print("No messages seen yet — open Telegram, send your bot any "
               "message (e.g. 'hi'), then rerun this.")
         return 1
-    chat = chats[-1]
+    distinct = {}
+    for c in chats:  # dedupe by id, last message wins
+        distinct[str(c["id"])] = c
+    if pick is not None:
+        if str(pick) not in distinct:
+            print(f"chat_id {pick} has not messaged the bot recently. Seen: "
+                  + ", ".join(f"{i} ({c.get('first_name') or '?'})"
+                              for i, c in distinct.items()))
+            return 1
+        chat = distinct[str(pick)]
+    elif len(distinct) > 1:
+        # binding alerts to whoever messaged last would silently hand the
+        # channel to the wrong person
+        print("Multiple people have messaged this bot — not guessing. "
+              "Rerun with the right one:")
+        for i, c in distinct.items():
+            print(f"  python3 sentry.py --telegram-setup {i}"
+                  f"   # {c.get('first_name') or '?'}")
+        return 1
+    else:
+        chat = chats[-1]
     ch["chat_id"] = str(chat["id"])
     ch["enabled"] = True
     with open(CONFIG_PATH, "w") as f:
@@ -516,7 +566,13 @@ def odyssey_70mm(vm):
     """Return list of non-past 70mm showtimes for the target movie."""
     hits = []
     for m in vm.get("movies", []):
-        if CFG["movie_match"] not in (m.get("title") or "").lower():
+        title = (m.get("title") or "").lower()
+        if CFG["movie_match"] not in title:
+            continue
+        # "odyssey" alone would also match a "2001: A Space Odyssey" 70mm
+        # revival — a real Lincoln Square occurrence — and a false drop
+        # would advance the horizon past real dates
+        if any(x in title for x in CFG.get("movie_exclude", [])):
             continue
         for v in m.get("variants", []):
             for g in v.get("amenityGroups", []):
@@ -542,11 +598,20 @@ def scan_dates(st, venue, dates):
         if i:
             time.sleep(CFG["sweep_spacing_seconds"] + random.uniform(0, 2))
         vm = fetch_day(st, venue, d)
+        if vm is BUDGET:
+            return found  # cap reached: stop scanning, breaker untouched
         if vm is None:
             breaker_fail(st)
             return found
         breaker_success(st)
         hits = odyssey_70mm(vm)
+        # seed availability baselines (first sight only — never clobber a
+        # pending soldout→available flip the restock poller hasn't seen yet)
+        # so a date's very first dedicated restock poll can already detect
+        # a flip instead of treating it as baseline
+        for h in hits:
+            st["seenAvailability"].setdefault(
+                f"{venue}|{d}|{h['time']}", h["type"])
         if hits:
             found[d] = {"total": len(hits),
                         "open": sum(1 for h in hits
@@ -630,18 +695,23 @@ def target_check(st, now):
                 or not announce_ok(st, date)):
             continue
         last = st["targetLastPoll"].get(date)
-        if (last and (now - dt.datetime.fromisoformat(last))
-                .total_seconds() < CFG.get("target_every_seconds", 120) * 0.9):
+        if (last and elapsed_seconds(now, last)
+                < CFG.get("target_every_seconds", 120) * 0.9):
             continue
         st["targetLastPoll"][date] = now.isoformat()
         for venue in CFG["venues"]:
             vm = fetch_day(st, venue, date)
+            if vm is BUDGET:
+                return
             if vm is None:
                 breaker_fail(st)
                 return
             breaker_success(st)
             slots = [h for h in odyssey_70mm(vm)
                      if slot_qualifies(h["time"])]
+            for h in slots:  # baseline for the refund sniper (first sight)
+                st["seenAvailability"].setdefault(
+                    f"{venue}|{date}|{h['time']}", h["type"])
             if not slots:
                 continue
             vcfg = CFG["venues"][venue]
@@ -697,8 +767,7 @@ def restock_due_dates(st, now):
         interval = (CFG.get("restock_burst_seconds", 60) if d <= tomorrow
                     else CFG.get("restock_every_seconds", 300))
         last = st["restockLastPoll"].get(d)
-        if (not last or (now - dt.datetime.fromisoformat(last))
-                .total_seconds() >= interval * 0.9):
+        if not last or elapsed_seconds(now, last) >= interval * 0.9:
             due.append(d)
     return due
 
@@ -736,6 +805,8 @@ def restock_check(st, venue, dates):
     freed = []
     for date in dates:
         vm = fetch_day(st, venue, date)
+        if vm is BUDGET:
+            return
         if vm is None:
             breaker_fail(st)
             return
@@ -770,7 +841,11 @@ def build_digest(st):
     lines = []
     targets = CFG.get("target_dates") or []
     if targets:
-        live = [d for d in targets if d in st.get("targetAlerted", [])]
+        # announced-elsewhere counts as live too: heals any date the drop
+        # path claimed before the target watch could
+        live = [d for d in targets
+                if d in st.get("targetAlerted", [])
+                or d in st.get("announced", [])]
         wait = [d for d in targets if d not in live]
         if wait:
             lines.append("Waiting on: " +
@@ -854,7 +929,7 @@ def main():
     rotate_log()
 
     st = load_state()
-    now = dt.datetime.now()
+    now = dt.datetime.now().astimezone()  # aware: DST-safe interval math
     fast = os.environ.get("SENTRY_NOW") == "1"
 
     if not fast:
@@ -864,8 +939,7 @@ def main():
     # tier's interval (burst / base / overnight) has elapsed. The 0.9
     # tolerates launchd scheduling drift.
     if not fast and st["lastPollAt"]:
-        last = dt.datetime.fromisoformat(st["lastPollAt"])
-        if (now - last).total_seconds() < poll_interval(now) * 0.9:
+        if elapsed_seconds(now, st["lastPollAt"]) < poll_interval(now) * 0.9:
             save_state(st)
             return
 
@@ -906,6 +980,7 @@ def main():
         st["lastReconcile"] = today
         auto = set()
         found_any = []
+        pre_fail = st["breaker"]["failures"]
         # start at today (not tomorrow): today's sellouts are the prime
         # refund-sniping targets
         for venue in CFG["venues"]:
@@ -922,8 +997,14 @@ def main():
             auto &= targets
         # canary: the run is known to be playing inside the reconcile window,
         # so zero hits across all of it means our parser stopped matching —
-        # cycles keep "succeeding" while we see nothing
-        if not any(found_any):
+        # cycles keep "succeeding" while we see nothing. Only diagnose the
+        # parser when the scans themselves were clean: a fetch failure or a
+        # budget stop also yields zero hits, and those already have their
+        # own (correctly attributed) alerts.
+        clean = (st["breaker"]["failures"] == pre_fail
+                 and st["breaker"]["state"] == "closed"
+                 and st.get("budgetAlerted") != today)
+        if not any(found_any) and clean:
             if not st.get("canaryAlerted"):
                 if push("SENTRY BLIND — parser",
                         f"Full {CFG['reconcile_days']}-day reconcile found 0 "
@@ -948,11 +1029,22 @@ def main():
         log(f"reconcile done (budget spent today: {st['budget']['spent']})")
         return
 
+    # target watch runs BEFORE the probe/sweep: both can discover the same
+    # date in one cycle (targets sit only days past the horizon), and
+    # whichever announces first claims it. The target path must win — its
+    # alert carries per-showtime links and arms the refund sniper instantly,
+    # while the drop path's generic alert would leave targetAlerted unset
+    # (digest stuck on "Waiting on:") and delay sniper arming to the next
+    # reconcile.
+    target_check(st, now)
+
     # steady state: one probe per venue at horizon+1
     for venue in CFG["venues"]:
         probe_date = (dt.date.fromisoformat(st["horizon"][venue]) +
                       dt.timedelta(days=1)).isoformat()
         vm = fetch_day(st, venue, probe_date)
+        if vm is BUDGET:
+            continue
         if vm is None:
             breaker_fail(st)
             continue
@@ -978,9 +1070,6 @@ def main():
                 f"{lf.get('movies')} movies] "
                 f"(budget {st['budget']['spent']}/{CFG['daily_request_budget']})")
 
-    # target watch: ring the moment a wanted date goes live
-    target_check(st, now)
-
     # restock sniping: each watched date on its own clock — tight when the
     # show is imminent, relaxed otherwise
     due = restock_due_dates(st, now)
@@ -998,10 +1087,10 @@ def status():
     """Human-readable health snapshot: age of last cycle is the number that
     matters — everything else is context."""
     st = load_state()
-    now = dt.datetime.now()
+    now = dt.datetime.now().astimezone()
     last = st.get("lastPollAt")
     age = ("never" if not last else
-           f"{int((now - dt.datetime.fromisoformat(last)).total_seconds())}s ago")
+           f"{int(elapsed_seconds(now, last))}s ago")
     print(f"last cycle:   {age}")
     print(f"cadence now:  {poll_interval(now)}s")
     print(f"budget:       {st['budget']['spent']}/"
@@ -1042,7 +1131,10 @@ if __name__ == "__main__":
     if "--status" in sys.argv:
         sys.exit(status())
     if "--telegram-setup" in sys.argv:
-        sys.exit(telegram_setup())
+        i = sys.argv.index("--telegram-setup")
+        pick = (sys.argv[i + 1] if len(sys.argv) > i + 1
+                and not sys.argv[i + 1].startswith("-") else None)
+        sys.exit(telegram_setup(pick))
     if "--startup-push" in sys.argv:
         sys.exit(startup_push())
     if "--digest-preview" in sys.argv:  # print only — never pushes

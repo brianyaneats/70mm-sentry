@@ -203,8 +203,10 @@ class TestBudget(SentryTest):
     def test_exhausted_budget_blocks_fetch_without_http(self):
         sentry.budget_ok(self.st)  # roll to today
         self.st["budget"]["spent"] = sentry.CFG["daily_request_budget"]
-        with mock.patch.object(sentry.urllib.request, "urlopen") as u:
-            self.assertIsNone(sentry.fetch_day(self.st, "AABQI", "2026-08-20"))
+        with mock.patch.object(sentry.urllib.request, "urlopen") as u, \
+                mock.patch.object(sentry, "push", return_value=True):
+            self.assertIs(sentry.fetch_day(self.st, "AABQI", "2026-08-20"),
+                          sentry.BUDGET)
         u.assert_not_called()
 
 
@@ -369,8 +371,8 @@ class TestNotifier(SentryTest):
             self.assertFalse(sentry.push("t", "b", priority="urgent"))
 
     def test_telegram_setup_discovers_chat_id_and_enables(self):
-        updates = {"result": [
-            {"message": {"chat": {"id": 111, "first_name": "Old"}}},
+        updates = {"result": [  # same person twice: unambiguous, auto-binds
+            {"message": {"chat": {"id": 987654, "first_name": "Brian"}}},
             {"message": {"chat": {"id": 987654, "first_name": "Brian"}}}]}
         writes = {}
 
@@ -1335,3 +1337,187 @@ class TestDailyDigest(SentryTest):
         self.st["budget"] = {"date": "2001-01-01", "spent": 999}
         sentry.budget_ok(self.st)
         self.assertEqual(self.st["budgetYesterday"], 999)
+
+
+class TestMovieExclude(SentryTest):
+    def test_space_odyssey_revival_is_not_a_drop(self):
+        sentry.CFG["movie_match"] = "the odyssey"
+        sentry.CFG["movie_exclude"] = ["space odyssey"]
+        vm = viewmodel([showtime()], title="2001: A Space Odyssey")
+        self.assertEqual(sentry.odyssey_70mm(vm), [])
+
+    def test_target_film_still_matches_with_exclude_set(self):
+        sentry.CFG["movie_match"] = "the odyssey"
+        sentry.CFG["movie_exclude"] = ["space odyssey"]
+        vm = viewmodel([showtime()], title="The Odyssey (2026)")
+        self.assertEqual(len(sentry.odyssey_70mm(vm)), 1)
+
+    def test_no_exclude_key_keeps_old_behavior(self):
+        vm = viewmodel([showtime()], title="2001: A Space Odyssey")
+        self.assertEqual(len(sentry.odyssey_70mm(vm)), 1)  # match: "odyssey"
+
+
+class TestBudgetSentinel(SentryTest):
+    def _exhaust(self):
+        sentry.budget_ok(self.st)  # roll to today
+        self.st["budget"]["spent"] = sentry.CFG["daily_request_budget"]
+
+    def test_exhaustion_returns_sentinel_not_none(self):
+        self._exhaust()
+        with mock.patch.object(sentry, "push", return_value=True):
+            self.assertIs(sentry.fetch_day(self.st, "AABQI", "2026-08-20"),
+                          sentry.BUDGET)
+
+    def test_exhaustion_alerts_once_per_day(self):
+        self._exhaust()
+        with mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.fetch_day(self.st, "AABQI", "2026-08-20")
+            sentry.fetch_day(self.st, "AABQI", "2026-08-21")
+        self.assertEqual(p.call_count, 1)
+        self.assertIn("budget", p.call_args.args[0].lower())
+
+    def test_failed_budget_alert_retries(self):
+        self._exhaust()
+        with mock.patch.object(sentry, "push", return_value=False) as p:
+            sentry.fetch_day(self.st, "AABQI", "2026-08-20")
+            sentry.fetch_day(self.st, "AABQI", "2026-08-21")
+        self.assertEqual(p.call_count, 2)  # not marked alerted until delivered
+
+    def test_scan_dates_stops_without_tripping_breaker(self):
+        self._exhaust()
+        with mock.patch.object(sentry, "push", return_value=True):
+            found = sentry.scan_dates(self.st, "AABQI", ["d1", "d2"])
+        self.assertEqual(found, {})
+        self.assertEqual(self.st["breaker"]["failures"], 0)
+        self.assertEqual(self.st["breaker"]["state"], "closed")
+
+    def test_restock_check_returns_without_tripping_breaker(self):
+        self._exhaust()
+        with mock.patch.object(sentry, "push", return_value=True):
+            sentry.restock_check(self.st, "AABQI", ["2026-08-20"])
+        self.assertEqual(self.st["breaker"]["failures"], 0)
+
+
+class TestBlindRearm(SentryTest):
+    def test_movies_reappearing_rearms_blind_alert(self):
+        self.st["blindStreak"] = 25
+        self.st["blindAlerted"] = True
+        body = json.dumps({"viewModel": viewmodel([showtime()])}).encode()
+        with mock.patch.object(sentry.urllib.request, "urlopen",
+                               return_value=FakeResp(body)):
+            vm = sentry.fetch_day(self.st, "AABQI", "2026-08-20")
+        self.assertIsNotNone(vm)
+        self.assertEqual(self.st["blindStreak"], 0)
+        self.assertFalse(self.st["blindAlerted"])
+
+
+class TestTargetBeforeProbe(SentryTest):
+    def test_target_check_runs_before_probe_loop_in_main(self):
+        # regression tripwire for the announce race: the target path must
+        # claim shared dates first or targetAlerted is never recorded
+        import inspect
+        src = inspect.getsource(sentry.main)
+        self.assertLess(src.index("target_check(st, now)"),
+                        src.index("steady state"))
+
+    def test_digest_counts_announced_dates_as_live(self):
+        sentry.CFG["target_dates"] = ["2026-08-21", "2026-08-22"]
+        self.st["announced"] = ["2026-08-21"]  # drop path claimed it
+        body = sentry.build_digest(self.st)
+        self.assertIn("Already on sale: Fri, Aug 21", body)
+        self.assertIn("Waiting on: Sat, Aug 22", body)
+
+
+class TestAvailabilitySeeding(SentryTest):
+    def test_scan_seeds_first_sight_but_never_clobbers(self):
+        self.st["seenAvailability"]["AABQI|d1|6:00p"] = "soldout"
+        data = {"d1": [showtime(), showtime(time_="9:00p",
+                                            type_="soldout")]}
+        with mock.patch.object(
+                sentry, "fetch_day",
+                side_effect=lambda st, v, d: viewmodel(data[d])):
+            sentry.scan_dates(self.st, "AABQI", ["d1"])
+        # pre-existing soldout preserved (pending flip stays detectable)...
+        self.assertEqual(self.st["seenAvailability"]["AABQI|d1|6:00p"],
+                         "soldout")
+        # ...new key seeded at first sight
+        self.assertEqual(self.st["seenAvailability"]["AABQI|d1|9:00p"],
+                         "soldout")
+
+    def test_seeded_baseline_lets_first_restock_poll_catch_flip(self):
+        # reconcile saw it soldout; seat returned before the first dedicated
+        # restock poll — previously treated as baseline, flip lost
+        self.st["seenAvailability"]["AABQI|2026-08-20|6:00p"] = "soldout"
+        vm = viewmodel([showtime(url="https://buy.example/x")])
+        with mock.patch.object(sentry, "fetch_day", return_value=vm), \
+                mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.restock_check(self.st, "AABQI", ["2026-08-20"])
+        p.assert_called_once()
+        self.assertIn("reopened", p.call_args.args[1])
+
+
+class TestElapsedSeconds(SentryTest):
+    def test_naive_iso_with_aware_now(self):
+        now = dt.datetime.now().astimezone()
+        naive_iso = (dt.datetime.now()
+                     - dt.timedelta(seconds=120)).isoformat()
+        self.assertAlmostEqual(
+            sentry.elapsed_seconds(now, naive_iso), 120, delta=5)
+
+    def test_aware_iso_with_naive_now(self):
+        now = dt.datetime.now()
+        aware_iso = (dt.datetime.now().astimezone()
+                     - dt.timedelta(seconds=60)).isoformat()
+        self.assertAlmostEqual(
+            sentry.elapsed_seconds(now, aware_iso), 60, delta=5)
+
+    def test_cross_zone_wall_clocks_compare_correctly(self):
+        eastern = zoneinfo.ZoneInfo("America/New_York")
+        pacific = zoneinfo.ZoneInfo("America/Los_Angeles")
+        base = dt.datetime(2026, 7, 25, 12, 0, tzinfo=eastern)
+        same_instant = base.astimezone(pacific)
+        self.assertEqual(
+            sentry.elapsed_seconds(base, same_instant.isoformat()), 0)
+
+
+class TestTelegramSetupGuard(SentryTest):
+    UPDATES = {"result": [
+        {"message": {"chat": {"id": 111, "first_name": "Friend"}}},
+        {"message": {"chat": {"id": 987654, "first_name": "Brian"}}}]}
+
+    def _run(self, pick=None):
+        def fake_urlopen(req, timeout=None):
+            url = req if isinstance(req, str) else req.full_url
+            if "getUpdates" in url:
+                return FakeResp(json.dumps(self.UPDATES).encode())
+            return FakeResp(b'{"ok": true}')
+        fd, tmpcfg = tempfile.mkstemp(suffix=".json")
+        os.close(fd)
+        old = sentry.CONFIG_PATH
+        sentry.CONFIG_PATH = tmpcfg
+        try:
+            with mock.patch.object(sentry.urllib.request, "urlopen",
+                                   side_effect=fake_urlopen):
+                return sentry.telegram_setup(pick)
+        finally:
+            sentry.CONFIG_PATH = old
+            os.unlink(tmpcfg)
+
+    def test_multiple_chats_refuses_to_guess(self):
+        sentry.CFG["channels"]["telegram"]["token"] = "T"
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(self._run(), 1)
+        self.assertIn("987654", out.getvalue())
+        self.assertIn("111", out.getvalue())
+
+    def test_explicit_pick_binds_that_chat(self):
+        sentry.CFG["channels"]["telegram"]["token"] = "T"
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self._run(pick="111"), 0)
+        self.assertEqual(
+            sentry.CFG["channels"]["telegram"]["chat_id"], "111")
+
+    def test_unknown_pick_rejected(self):
+        sentry.CFG["channels"]["telegram"]["token"] = "T"
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(self._run(pick="424242"), 1)

@@ -61,7 +61,7 @@ def poll_age_seconds(now):
     last = st.get("lastPollAt")
     if not last:
         return None
-    return (now - dt.datetime.fromisoformat(last)).total_seconds()
+    return sentry.elapsed_seconds(now, last)
 
 
 def recent_errors(limit=400, keep=4):
@@ -106,8 +106,7 @@ def check(now=None):
     if down:
         last_alert = wd.get("lastAlertAt")
         due = (not last_alert or
-               (now - dt.datetime.fromisoformat(last_alert)).total_seconds()
-               >= renotify)
+               sentry.elapsed_seconds(now, last_alert) >= renotify)
         if not wd.get("down") or due:
             mins = "unknown" if age is None else f"{int(age // 60)} min"
             errs = recent_errors()
@@ -133,8 +132,7 @@ def check(now=None):
             since = wd.get("downSince")
             for_ = ""
             if since:
-                mins = int((now - dt.datetime.fromisoformat(since))
-                           .total_seconds() // 60)
+                mins = int(sentry.elapsed_seconds(now, since) // 60)
                 for_ = f" after {mins} min down" if mins else " after <1 min"
             if sentry.push("SENTRY BACK UP",
                            f"Watcher is polling again{for_} "

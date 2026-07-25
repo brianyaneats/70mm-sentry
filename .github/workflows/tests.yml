@@ -1,0 +1,27 @@
+name: tests
+# CI gate: the suite must pass on every push/PR — 139+ mocked tests that
+# previously only ran when someone remembered to run them locally.
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # tests import sentry, which loads config at module import; the live
+      # config.json is untracked (it holds tokens), so seed from the example
+      - run: cp config.example.json config.json
+      - run: python -m unittest discover -s tests -v
