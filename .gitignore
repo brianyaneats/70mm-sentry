@@ -2,3 +2,6 @@ config.json
 state.json
 *.log
 __pycache__/
+last_response.json
+watchdog_state.json
+.sentry.lock

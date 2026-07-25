@@ -47,11 +47,63 @@ Design doc (weak points W1–W6 enumerated): https://claude.ai/code/artifact/e57
   these from `dropLog` once real drops are observed; otherwise
   `base_interval_seconds`; overnight (23:00–07:00) runs at
   `overnight_interval_seconds` (default hourly). Burst windows beat the
-  overnight tier.
+  overnight tier. **All window hours are evaluated in `schedule_tz`** (the
+  theater's zone, `America/New_York`), not the host's — AMC posts on Eastern
+  afternoons and this Mac is on Pacific.
 - **Politeness:** hard daily request budget (enforced in code), start jitter,
   circuit breaker on failures
   (3 strikes → open 30 min, exponential to 4 h cap, one degraded alert at 6).
 - **W5 guard:** weekly low-priority "Sentry alive" push proves the whole channel.
+
+## One alert per date
+
+Three paths can reach the same date (the target watch, the probe's instant
+ping, the sweep's detail alert), so `state.announced` is the single ledger:
+whichever path announces a date first claims it, and the others go quiet.
+The horizon still advances past suppressed dates — otherwise the probe
+re-hits the same date forever. Restock alerts dedupe per showtime
+(`state.restockAlerted`) so a seat that flaps sold-out/open rings once.
+Nothing is marked announced unless the push actually delivered, so a failed
+alert retries next cycle. `instant_alert: false` collapses the two-stage
+"detected now, details in ~1 min" ping into a single alert.
+
+## Concurrency
+
+launchd fires every 10 s but a probe-hit sweep runs 60–90 s. `flock` on
+`.sentry.lock` keeps it single-flight, and each cycle persists `lastPollAt`
+*before* the long work so a later fire sees a fresh timestamp instead of
+starting a duplicate cycle and clobbering state at the moment of a drop.
+
+## Observability
+
+Three distinct silent-failure modes, three separate alarms — a quiet log looks
+identical to a healthy one, so each is detected explicitly:
+
+- **Dead** (process never runs): `watchdog.py` on its own launchd job every
+  5 min reads `state.json`'s `lastPollAt`; stale past
+  `watchdog_stale_seconds` (600) → urgent **SENTRY DOWN** push carrying the
+  error lines it scraped from `launchd.log`. Its plist picks the first
+  working interpreter from a list, so an interpreter break (e.g. an Xcode
+  install invalidating `/usr/bin/python3`, which happened 2026-07-24) kills
+  the sentry but not its alarm. Alerts once per outage, re-nags every
+  `watchdog_renotify_hours`, sends a quiet note on recovery.
+- **Blind** (requests succeed, payload is empty): every fetch records
+  `state.lastFetch` = HTTP status, byte count, movie count, 70mm hit count,
+  and the per-cycle log line carries them (`[HTTP 200 15545B 1 movies]`).
+  `blind_streak_alert` (20) consecutive zero-movie responses → urgent
+  **SENTRY BLIND** push.
+- **Mis-parsing** (payload fine, matching broken): the daily reconcile knows
+  the run is playing inside its own window, so finding 0 IMAX 70mm showtimes
+  across all 21 days means `odyssey_70mm()` stopped matching a changed feed
+  shape → urgent **SENTRY BLIND — parser** push.
+
+`capture_last_response` writes each raw payload to `last_response.json` for
+diffing when the shape changes. `python3 sentry.py --status` prints
+last-cycle age, cadence, budget, breaker, horizon, and targets on demand.
+
+Not covered on-box: Mac asleep or powered off takes the watchdog down too.
+Only an off-box dead-man's switch (`healthchecks_url`, pinged every cycle)
+closes that.
 
 ## Notification layer
 
@@ -104,13 +156,16 @@ To go WhatsApp-only, set `channels.ntfy.enabled: false`.
 cd ~/Developer/70mm-sentry && python3 -m unittest discover -s tests -v
 ```
 
-22 unit tests, all network mocked: 70mm detection (incl. soldout/restricted
+69 unit tests, all network mocked: 70mm detection (incl. soldout/restricted
 typing), drop handling (horizon advances only on delivered alerts; failed
 push retries), sweep cutoff, budget rollover/exhaustion, breaker
 open/half-open/recover + single degraded alert, notifier fan-out (one channel
-failing doesn't lose the alert), CallMeBot URL + Meta template payloads, and
-the Referer header on every fetch. Live layer checks: `--test-push` plus
-polling the ntfy topic JSON to confirm receipt.
+failing doesn't lose the alert) incl. best-effort channel broadcast,
+CallMeBot URL + Meta template payloads, the Referer header on every fetch,
+cadence tiers + burst windows, target-date watch and evening slot filtering,
+response telemetry + blind-streak alerting, and watchdog liveness
+(staleness, dedup, re-nag, recovery, error capture). Live layer checks:
+`--test-push` plus polling the ntfy topic JSON to confirm receipt.
 
 ## Channel vendor verdict (checked 2026-07-24)
 

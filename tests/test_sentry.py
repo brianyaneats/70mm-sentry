@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import unittest
+import zoneinfo
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -608,6 +609,165 @@ class TestCadence(SentryTest):
             {"days": ["Thu"], "start_hour": 23, "end_hour": 24}]
         self.assertEqual(
             sentry.poll_interval(dt.datetime(2026, 7, 23, 23, 30)), 20)
+
+
+class TestAnnounceOnce(SentryTest):
+    """One alert per date, whichever path reaches it first."""
+
+    def test_target_alert_suppresses_later_drop_alert(self):
+        sentry.CFG["target_dates"] = ["2026-08-21"]
+        with mock.patch.object(sentry, "fetch_day",
+                               return_value=viewmodel([showtime(
+                                   time_="7:00p")])), \
+             mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.target_check(self.st, dt.datetime(2026, 8, 1, 12, 0))
+        self.assertEqual(p.call_count, 1)
+        self.assertIn("2026-08-21", self.st["announced"])
+        # the sweep later covers the same date — must stay silent
+        with mock.patch.object(sentry, "push", return_value=True) as p2:
+            sentry.handle_drop(self.st, "AABQI",
+                               {"2026-08-21": {"total": 3, "open": 3}})
+        p2.assert_not_called()
+
+    def test_horizon_still_advances_past_suppressed_dates(self):
+        """Otherwise the probe re-hits that date forever."""
+        self.st["announced"] = ["2026-08-21"]
+        with mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.handle_drop(self.st, "AABQI",
+                               {"2026-08-21": {"total": 3, "open": 3}})
+        p.assert_not_called()
+        self.assertEqual(self.st["horizon"]["AABQI"], "2026-08-21")
+
+    def test_drop_alert_announces_every_date_it_covered(self):
+        with mock.patch.object(sentry, "push", return_value=True):
+            sentry.handle_drop(self.st, "AABQI",
+                               {"2026-08-20": {"total": 2, "open": 2},
+                                "2026-08-21": {"total": 3, "open": 1}})
+        self.assertEqual(self.st["announced"], ["2026-08-20", "2026-08-21"])
+
+    def test_failed_drop_push_leaves_dates_unannounced(self):
+        with mock.patch.object(sentry, "push", return_value=False):
+            sentry.handle_drop(self.st, "AABQI",
+                               {"2026-08-20": {"total": 2, "open": 2}})
+        self.assertEqual(self.st["announced"], [])
+
+    def test_instant_ping_suppressed_for_announced_date(self):
+        self.st["announced"] = ["2026-08-20"]
+        with mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.maybe_instant_alert(self.st, "AABQI", "2026-08-20")
+        p.assert_not_called()
+
+    def test_instant_ping_can_be_disabled(self):
+        sentry.CFG["instant_alert"] = False
+        with mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.maybe_instant_alert(self.st, "AABQI", "2026-08-20")
+        p.assert_not_called()
+
+    def test_restock_rings_once_per_showtime(self):
+        sentry.CFG["restock_watch_dates"] = ["2026-08-15"]
+        self.st["seenAvailability"]["AABQI|2026-08-15|6:00p"] = "soldout"
+        with mock.patch.object(sentry, "fetch_day",
+                               return_value=viewmodel([showtime(
+                                   type_="available", time_="6:00p")])), \
+             mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.restock_check(self.st, "AABQI", ["2026-08-15"])
+        p.assert_called_once()
+        # seat flaps sold-out then open again — no second ring
+        self.st["seenAvailability"]["AABQI|2026-08-15|6:00p"] = "soldout"
+        with mock.patch.object(sentry, "fetch_day",
+                               return_value=viewmodel([showtime(
+                                   type_="available", time_="6:00p")])), \
+             mock.patch.object(sentry, "push", return_value=True) as p2:
+            sentry.restock_check(self.st, "AABQI", ["2026-08-15"])
+        p2.assert_not_called()
+
+
+class TestScheduleTimezone(SentryTest):
+    def test_windows_follow_theater_clock_not_machine(self):
+        sentry.CFG["schedule_tz"] = "America/New_York"
+        sentry.CFG["burst_windows"] = [
+            {"days": ["Wed"], "start_hour": 12, "end_hour": 18}]
+        pacific = zoneinfo.ZoneInfo("America/Los_Angeles")
+        # 10:00 Wed Pacific == 13:00 Wed Eastern -> inside the ET window
+        self.assertEqual(sentry.poll_interval(
+            dt.datetime(2026, 7, 29, 10, 0, tzinfo=pacific)), 20)
+        # 06:00 Wed Pacific == 09:00 Wed Eastern -> outside it
+        self.assertEqual(sentry.poll_interval(
+            dt.datetime(2026, 7, 29, 6, 0, tzinfo=pacific)), 60)
+
+    def test_quiet_hours_use_theater_clock(self):
+        sentry.CFG["schedule_tz"] = "America/New_York"
+        pacific = zoneinfo.ZoneInfo("America/Los_Angeles")
+        # 21:00 Pacific == 00:00 Eastern -> overnight tier
+        self.assertEqual(sentry.poll_interval(
+            dt.datetime(2026, 7, 29, 21, 0, tzinfo=pacific)), 3600)
+
+    def test_bad_timezone_falls_back_to_local(self):
+        sentry.CFG["schedule_tz"] = "Not/AZone"
+        self.assertEqual(
+            sentry.poll_interval(dt.datetime(2026, 7, 29, 15, 0)), 60)
+
+
+class TestSingleFlight(SentryTest):
+    def setUp(self):
+        super().setUp()
+        self._lock, self._state = sentry.LOCK_PATH, sentry.STATE_PATH
+        self.tmp = tempfile.mkdtemp()
+        sentry.LOCK_PATH = os.path.join(self.tmp, ".lock")
+        sentry.STATE_PATH = os.path.join(self.tmp, "state.json")
+        sentry._LOCK_FH = None
+
+    def tearDown(self):
+        if sentry._LOCK_FH:
+            sentry._LOCK_FH.close()
+            sentry._LOCK_FH = None
+        sentry.LOCK_PATH, sentry.STATE_PATH = self._lock, self._state
+        super().tearDown()
+
+    def test_second_holder_is_refused(self):
+        self.assertTrue(sentry.acquire_lock())
+        first = sentry._LOCK_FH
+        sentry._LOCK_FH = None
+        self.assertFalse(sentry.acquire_lock())  # same process, 2nd handle
+        first.close()
+
+    def test_lock_frees_when_holder_closes(self):
+        self.assertTrue(sentry.acquire_lock())
+        sentry._LOCK_FH.close()
+        sentry._LOCK_FH = None
+        self.assertTrue(sentry.acquire_lock())
+
+    def test_overlapping_run_exits_without_touching_state(self):
+        """A cycle that starts mid-sweep must not fetch, alert, or save."""
+        self.assertTrue(sentry.acquire_lock())  # stand in for the sweeper
+        held = sentry._LOCK_FH
+        sentry._LOCK_FH = None
+        with mock.patch.object(sentry, "fetch_day") as f, \
+             mock.patch.object(sentry, "push") as p, \
+             mock.patch.object(sentry, "save_state") as s:
+            sentry.main()
+        f.assert_not_called()
+        p.assert_not_called()
+        s.assert_not_called()
+        held.close()
+
+    def test_cycle_claims_slot_on_disk_before_long_work(self):
+        """lastPollAt must hit disk before the sweep, or the next launchd
+        fire reads a stale timestamp and starts a duplicate cycle."""
+        saves = []
+
+        def fake_scan(st, venue, dates):
+            saves.append(json.load(open(sentry.STATE_PATH))["lastPollAt"])
+            return {}
+
+        with mock.patch.object(sentry, "fetch_day",
+                               return_value=viewmodel([showtime()])), \
+             mock.patch.object(sentry, "scan_dates", side_effect=fake_scan), \
+             mock.patch.object(sentry, "push", return_value=True), \
+             mock.patch.object(sentry, "target_check"):
+            sentry.main()
+        self.assertTrue(saves, "sweep never ran")
+        self.assertIsNotNone(saves[0], "lastPollAt was not persisted pre-sweep")
 
 
 class TestResponseTelemetry(SentryTest):

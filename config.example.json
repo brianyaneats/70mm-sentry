@@ -26,6 +26,7 @@
   },
   "healthchecks_url": "",
   "blind_streak_alert": 20,
+  "log_max_bytes": 5000000,
   "capture_last_response": true,
   "watchdog_stale_seconds": 600,
   "watchdog_renotify_hours": 6,
@@ -40,23 +41,21 @@
       "tz_label": "ET"
     }
   },
-  "target_dates": [
-    "2026-08-21",
-    "2026-08-22",
-    "2026-08-26"
-  ],
+  "target_dates": [],
   "target_after_hour": 18,
   "target_every_seconds": 30,
   "restock_watch_dates": [],
   "restock_every_seconds": 300,
   "restock_burst_seconds": 60,
+  "schedule_tz": "America/New_York",
+  "instant_alert": true,
   "burst_windows": [
     {
       "days": [
         "Tue",
         "Wed"
       ],
-      "start_hour": 9,
+      "start_hour": 12,
       "end_hour": 18
     }
   ],

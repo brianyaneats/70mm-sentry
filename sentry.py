@@ -11,6 +11,7 @@ Env flags: SENTRY_NOW=1 skips start jitter and the overnight cadence gate.
 """
 
 import datetime as dt
+import fcntl
 import json
 import os
 import random
@@ -20,6 +21,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zoneinfo
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE, "config.json")
@@ -31,6 +33,37 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
 NAPI = "https://www.fandango.com/napi/theaterMovieShowtimes/{venue}?date={date}"
 
 CFG = json.load(open(CONFIG_PATH))
+
+
+LOCK_PATH = os.path.join(BASE, ".sentry.lock")
+_LOCK_FH = None
+
+
+def acquire_lock():
+    """Only one cycle at a time. flock is released by the kernel if the
+    process dies, so a crash mid-sweep can't wedge the watcher."""
+    global _LOCK_FH
+    fh = open(LOCK_PATH, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (BlockingIOError, OSError):
+        fh.close()
+        return False
+    _LOCK_FH = fh  # held for process lifetime; GC would drop the lock
+    return True
+
+
+def rotate_log():
+    """Keep sentry.log bounded — 30s polling writes ~8 MB/month."""
+    cap = CFG.get("log_max_bytes", 5_000_000)
+    try:
+        if os.path.getsize(LOG_PATH) < cap:
+            return
+        os.replace(LOG_PATH, LOG_PATH + ".1")
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
 
 
 def log(msg):
@@ -60,7 +93,19 @@ def default_state():
         "restockLastPoll": {},
         "targetAlerted": [],
         "targetLastPoll": {},
+        "announced": [],
+        "restockAlerted": [],
     }
+
+
+def announce_ok(st, date):
+    """One announcement per date, whichever path gets there first — the
+    target watch and the drop sweep both cover the same dates."""
+    return date not in st.get("announced", [])
+
+
+def mark_announced(st, dates):
+    st["announced"] = sorted(set(st.get("announced", [])) | set(dates))
 
 
 def load_state():
@@ -404,6 +449,10 @@ def maybe_instant_alert(st, venue, probe_date):
     re-ring every cycle."""
     if st["instantAlerted"].get(venue) == probe_date:
         return
+    # the two-stage ping is one event, not two dates; suppress it entirely
+    # when the date was already announced elsewhere (e.g. the target watch)
+    if not CFG.get("instant_alert", True) or not announce_ok(st, probe_date):
+        return
     vcfg = CFG["venues"][venue]
     if push(f"70mm DROP detected — {vcfg['name']}",
             f"New dates past {st['horizon'][venue]} just appeared. "
@@ -437,7 +486,8 @@ def target_check(st, now):
     moment one goes live with a qualifying slot. Sold-out qualifying slots
     arm the refund sniper immediately."""
     for date in CFG.get("target_dates", []):
-        if date in st["targetAlerted"] or date < now.date().isoformat():
+        if (date in st["targetAlerted"] or date < now.date().isoformat()
+                or not announce_ok(st, date)):
             continue
         last = st["targetLastPoll"].get(date)
         if (last and (now - dt.datetime.fromisoformat(last))
@@ -473,6 +523,7 @@ def target_check(st, now):
             if push(f"70mm TARGET LIVE — {vcfg['name']}",
                     "\n".join(lines)):
                 st["targetAlerted"].append(date)
+                mark_announced(st, [date])
                 if gone:
                     st["autoRestockDates"] = sorted(
                         set(st["autoRestockDates"]) | {date})
@@ -509,14 +560,30 @@ def restock_due_dates(st, now):
     return due
 
 
+def schedule_time(now):
+    """Quiet hours and burst windows are about the THEATER's clock (AMC posts
+    on Eastern afternoons), not wherever this Mac happens to be."""
+    tzname = CFG.get("schedule_tz")
+    if not tzname:
+        return now
+    try:
+        if now.tzinfo is None:
+            now = now.astimezone()  # attach this machine's zone
+        return now.astimezone(zoneinfo.ZoneInfo(tzname))
+    except Exception as e:
+        log(f"schedule_tz {tzname!r} unusable ({e}); using local time")
+        return now
+
+
 def poll_interval(now):
     """Seconds between polls right now. Burst windows (configured drop
     windows) beat the overnight stretch; otherwise base cadence."""
+    t = schedule_time(now)
     for w in CFG.get("burst_windows", []):
-        if (now.strftime("%a") in w["days"] and
-                w["start_hour"] <= now.hour < w["end_hour"]):
+        if (t.strftime("%a") in w["days"] and
+                w["start_hour"] <= t.hour < w["end_hour"]):
             return CFG.get("burst_interval_seconds", 20)
-    if now.hour >= CFG["quiet_start_hour"] or now.hour < CFG["quiet_end_hour"]:
+    if t.hour >= CFG["quiet_start_hour"] or t.hour < CFG["quiet_end_hour"]:
         return CFG.get("overnight_interval_seconds", 3600)
     return CFG.get("base_interval_seconds", 60)
 
@@ -537,21 +604,32 @@ def restock_check(st, venue, dates):
             prev = st["seenAvailability"].get(key)
             st["seenAvailability"][key] = h["type"]
             if prev in ("soldout", "restricted") and h["type"] == "available":
-                freed.append((date, h["time"], h.get("url")))
+                # once per showtime: a seat that flaps sold-out/open would
+                # otherwise re-ring on every flip
+                if key not in st["restockAlerted"]:
+                    freed.append((date, h["time"], h.get("url"), key))
     if freed:
         vcfg = CFG["venues"][venue]
         lines = [f"Status flipped sold-out → on-sale ({vcfg['tz_label']}) — "
                  f"tap to confirm real seats on the map:"]
-        for date, t, url in freed:
+        for date, t, url, _ in freed:
             lines.append(f"{date} {t} → {url or vcfg['link']}")
-        push(f"70mm RESTOCK — {vcfg['name']}", "\n".join(lines))
+        if push(f"70mm RESTOCK — {vcfg['name']}", "\n".join(lines)):
+            st["restockAlerted"].extend(k for *_, k in freed)
 
 
 def handle_drop(st, venue, found):
     vcfg = CFG["venues"][venue]
     new = {d: c for d, c in found.items()
-           if d > st["horizon"][venue] and d not in st["alerted"][venue]}
+           if d > st["horizon"][venue] and d not in st["alerted"][venue]
+           and announce_ok(st, d)}
     if not new:
+        # nothing left to say, but the horizon still has to move past dates
+        # the target watch already announced, or the probe re-hits forever
+        seen = [d for d in found if d > st["horizon"][venue]
+                and not announce_ok(st, d)]
+        if seen:
+            st["horizon"][venue] = max(max(seen), st["horizon"][venue])
         return
     total = sum(c["total"] for c in new.values())
     open_ = sum(c["open"] for c in new.values())
@@ -562,6 +640,7 @@ def handle_drop(st, venue, found):
             f"{vcfg['tz_label']}). unconfirmed · per Fandango\n{vcfg['link']}")
     if push(f"70mm DROP — {vcfg['name']}", body):
         st["alerted"][venue].extend(sorted(new))
+        mark_announced(st, new)
         st["dropLog"].append({"venue": venue,
                               "detectedAt": dt.datetime.now().isoformat(),
                               "datesAdded": sorted(new),
@@ -573,6 +652,12 @@ def handle_drop(st, venue, found):
 # ---------- main ----------
 
 def main():
+    if not acquire_lock():
+        # normal during a sweep: launchd keeps firing while a cycle runs
+        log("another cycle already running; skipping")
+        return
+    rotate_log()
+
     st = load_state()
     now = dt.datetime.now()
     fast = os.environ.get("SENTRY_NOW") == "1"
@@ -594,7 +679,13 @@ def main():
         save_state(st)
         return
 
+    # claim the slot on disk BEFORE the long work. A probe-hit sweep runs
+    # ~60-90s while launchd keeps firing every 10s; without this the next
+    # process reads a stale lastPollAt, starts its own cycle, and the two
+    # race to save_state — duplicate alerts and clobbered horizon, exactly
+    # during a drop.
     st["lastPollAt"] = now.isoformat()
+    save_state(st)
 
     # weekly self-test: proves the notification channel end to end (W5)
     today = dt.date.today().isoformat()
