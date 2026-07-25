@@ -127,6 +127,43 @@ class TestLiveness(WatchdogTest):
         p.assert_not_called()
 
 
+class TestReadOnlyCheck(WatchdogTest):
+    """--check backs the container HEALTHCHECK, which runs on its own
+    schedule alongside the entrypoint's watchdog loop — it must observe
+    without pushing or racing the loop on watchdog_state.json."""
+
+    def test_fresh_poll_reads_alive(self):
+        self.write_state((NOW - dt.timedelta(seconds=45)).isoformat())
+        down, age = watchdog.is_stale(NOW)
+        self.assertFalse(down)
+        self.assertAlmostEqual(age, 45, delta=1)
+
+    def test_stale_poll_reads_down(self):
+        self.write_state((NOW - dt.timedelta(minutes=25)).isoformat())
+        down, _ = watchdog.is_stale(NOW)
+        self.assertTrue(down)
+
+    def test_missing_state_reads_down(self):
+        down, age = watchdog.is_stale(NOW)
+        self.assertTrue(down)
+        self.assertIsNone(age)
+
+    def test_probe_neither_pushes_nor_writes_watchdog_state(self):
+        self.write_state((NOW - dt.timedelta(minutes=25)).isoformat())
+        with mock.patch.object(sentry, "push") as p:
+            watchdog.is_stale(NOW)
+        p.assert_not_called()
+        self.assertFalse(os.path.exists(watchdog.WD_STATE))
+
+    def test_full_check_still_alerts_on_the_same_verdict(self):
+        """is_stale() and check() must agree — the refactor may not drift."""
+        self.write_state((NOW - dt.timedelta(minutes=25)).isoformat())
+        self.assertTrue(watchdog.is_stale(NOW)[0])
+        rc, p = self.run_check()
+        self.assertEqual(rc, 1)
+        p.assert_called_once()
+
+
 class TestErrorCapture(WatchdogTest):
     def test_alert_carries_recent_launchd_errors(self):
         with open(watchdog.LAUNCHD_LOG, "w") as f:

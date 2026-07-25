@@ -16,6 +16,7 @@ import json
 import os
 import random
 import re
+import socket
 import sys
 import time
 import urllib.error
@@ -62,6 +63,11 @@ def apply_env(cfg):
                                if x.strip()]
     if e.get("SCHEDULE_TZ"):
         cfg["schedule_tz"] = e["SCHEDULE_TZ"]
+    # names the box in ops alert titles, so during a migration a Mac alert
+    # and a VPS alert are distinguishable at a glance
+    cfg["instance_name"] = (e.get("INSTANCE_NAME")
+                            or cfg.get("instance_name")
+                            or socket.gethostname())
     return cfg
 
 
@@ -157,6 +163,28 @@ def save_state(st):
     os.replace(tmp, STATE_PATH)
 
 
+def snapshot_state(st, keep=7):
+    """Daily copy of state.json (called from the reconcile, which already
+    runs once a day). A wiped or corrupted volume would otherwise reset the
+    horizon to seed_horizon and re-announce every date you already know."""
+    snap_dir = os.path.join(os.path.dirname(STATE_PATH), "snapshots")
+    try:
+        os.makedirs(snap_dir, exist_ok=True)
+        path = os.path.join(snap_dir,
+                            f"state-{dt.date.today().isoformat()}.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(st, f, indent=2)
+        os.replace(tmp, path)
+        snaps = sorted(f for f in os.listdir(snap_dir)
+                       if f.startswith("state-") and f.endswith(".json"))
+        for old in snaps[:-keep]:
+            os.unlink(os.path.join(snap_dir, old))
+    except Exception as e:
+        # a failed snapshot must never take down the watcher it protects
+        log(f"state snapshot failed: {e}")
+
+
 # ---------- budget & breaker ----------
 
 def budget_ok(st, n=1):
@@ -190,7 +218,7 @@ def breaker_fail(st):
         b["state"] = "open"
         b["openUntil"] = time.time() + backoff
         log(f"breaker OPEN for {backoff}s (failures={b['failures']})")
-    if b["failures"] == 6 and not b["degradedSent"]:
+    if b["failures"] >= 6 and not b["degradedSent"]:
         err = (st.get("lastFetch") or {}).get("error", "")
         # a datacenter IP getting refused is the predicted failure when this
         # runs off-laptop — name it instead of a generic "unreadable"
@@ -204,8 +232,10 @@ def breaker_fail(st):
                      "Moving back to a residential IP is the fix.")
         else:
             body += "Backing off and retrying automatically."
-        push("Sentry degraded", body, priority="default", tags="warning")
-        b["degradedSent"] = True
+        # only a DELIVERED alert counts — a push lost to a channel outage
+        # retries on the next failure instead of vanishing
+        if push("Sentry degraded", body, priority="default", tags="warning"):
+            b["degradedSent"] = True
 
 
 def breaker_success(st):
@@ -419,6 +449,13 @@ def push(title, body, priority="urgent", tags=None, audience="private"):
     also broadcasts to subscriber channels — reserve it for the handful of
     alerts a friend actually wants: a date going live, a drop, a seat
     opening up. Nobody subscribed to hear that a launchd job restarted."""
+    # ops alerts name the box they came from; ticket alerts stay clean for
+    # the channel. Done here, at the single choke point, so no future ops
+    # alert can forget it and no ticket alert can pick it up.
+    if audience != "all":
+        inst = CFG.get("instance_name")
+        if inst:
+            title = f"{title} [{inst}]"
     delivered = []
     for name, sender in CHANNELS.items():
         ch = CFG.get("channels", {}).get(name, {})
@@ -827,6 +864,7 @@ def main():
             d: t for d, t in st["targetLastPoll"].items() if d >= today}
         heartbeat()
         save_state(st)
+        snapshot_state(st)
         log(f"reconcile done (budget spent today: {st['budget']['spent']})")
         return
 
@@ -895,7 +933,20 @@ def status():
     print(f"alerted:      {st.get('targetAlerted') or '(none)'}")
     print(f"restock watch:{restock_watchlist(st) or ' (none)'}")
     print(f"healthchecks: {CFG.get('healthchecks_url') or '(NOT SET)'}")
+    print(f"instance:     {CFG.get('instance_name') or '(unnamed)'}")
     return 0
+
+
+def startup_push():
+    """Deploy/restart visibility: a private note naming the box, what it is
+    watching, and for which dates. Sent by the container entrypoint, so an
+    unexpected restart announces itself instead of passing silently."""
+    venues = ", ".join(v["name"] for v in CFG["venues"].values())
+    targets = CFG.get("target_dates") or []
+    watching = (f"Watching {venues} for {', '.join(targets)}" if targets
+                else f"Watching {venues} for new dates")
+    ok = push("Sentry started", watching + ".", priority="low")
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
@@ -903,6 +954,8 @@ if __name__ == "__main__":
         sys.exit(status())
     if "--telegram-setup" in sys.argv:
         sys.exit(telegram_setup())
+    if "--startup-push" in sys.argv:
+        sys.exit(startup_push())
     if "--test-push" in sys.argv:
         ok = push("Sentry channel test",
                   "If you can read this, the notification layer reaches you.",

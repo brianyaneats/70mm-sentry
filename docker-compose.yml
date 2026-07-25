@@ -17,6 +17,8 @@ services:
       NTFY_TOPIC: ${NTFY_TOPIC:-}
       HEALTHCHECKS_URL: ${HEALTHCHECKS_URL:-}
       TARGET_DATES: ${TARGET_DATES:-}
+      # names this box in ops alert titles, e.g. "Sentry degraded [vps-nyc3]"
+      INSTANCE_NAME: ${INSTANCE_NAME:-}
 
     volumes:
       # state.json, logs and the lock live here and must survive restarts —

@@ -19,14 +19,18 @@ fi
 trap 'kill 0' TERM INT
 
 python /app/sentry.py --status || true
+# deploys AND unexpected restarts announce themselves (private audience)
+python /app/sentry.py --startup-push || true
 
 while true; do
     python /app/watchdog.py >/dev/null 2>&1 || true
     sleep "$WATCHDOG_TICK"
 done &
 
+# stderr also lands in launchd.log so the watchdog's SENTRY DOWN alert can
+# quote the actual traceback, same as launchd gave it on the Mac
 while true; do
-    python /app/sentry.py || true
+    python /app/sentry.py 2>> "$DATA/launchd.log" || true
     sleep "$TICK"
 done &
 

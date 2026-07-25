@@ -85,6 +85,15 @@ def recent_errors(limit=400, keep=4):
     return list(reversed(out))
 
 
+def is_stale(now=None):
+    """Read-only liveness verdict: (down, age_seconds). Shared by check()
+    and --check; neither pushes nor touches watchdog_state.json here."""
+    now = now or dt.datetime.now()
+    age = poll_age_seconds(now)
+    stale_after = sentry.CFG.get("watchdog_stale_seconds", 600)
+    return (age is None or age > stale_after), age
+
+
 def check(now=None):
     now = now or dt.datetime.now()
     cfg = sentry.CFG
@@ -92,8 +101,7 @@ def check(now=None):
     renotify = cfg.get("watchdog_renotify_hours", 6) * 3600
 
     wd = load_wd_state()
-    age = poll_age_seconds(now)
-    down = age is None or age > stale_after
+    down, age = is_stale(now)
 
     if down:
         last_alert = wd.get("lastAlertAt")
@@ -148,4 +156,12 @@ def check(now=None):
 
 
 if __name__ == "__main__":
+    if "--check" in sys.argv:
+        # pure probe for the container HEALTHCHECK: exit code only, no
+        # pushes, no watchdog_state.json — the entrypoint's own watchdog
+        # loop stays the single writer of alert state
+        down, age = is_stale()
+        print("stale" if down else "alive",
+              "(no cycle recorded)" if age is None else f"(age {int(age)}s)")
+        sys.exit(1 if down else 0)
     sys.exit(check())

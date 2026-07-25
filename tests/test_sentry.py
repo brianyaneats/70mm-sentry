@@ -5,8 +5,10 @@
 All network I/O is mocked; nothing here touches Fandango, ntfy, or WhatsApp.
 """
 
+import contextlib
 import copy
 import datetime as dt
+import io
 import json
 import os
 import sys
@@ -17,6 +19,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import sentry  # noqa: E402
+import preflight  # noqa: E402
 
 TEST_CFG = {
     "channels": {
@@ -223,6 +226,22 @@ class TestBreaker(SentryTest):
         self.assertEqual(p.call_count, 1)
         self.assertIn("degraded", p.call_args.args[0].lower()
                       + p.call_args.args[1].lower())
+
+    def test_lost_degraded_alert_retries_on_next_failure(self):
+        """On a full cutover this alert is a primary signal — a push lost
+        to a channel outage must not mark itself delivered."""
+        with mock.patch.object(sentry, "push", return_value=False) as p:
+            for _ in range(6):
+                sentry.breaker_fail(self.st)
+        self.assertEqual(p.call_count, 1)
+        self.assertFalse(self.st["breaker"]["degradedSent"])
+        with mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.breaker_fail(self.st)          # failure #7 retries
+        p.assert_called_once()
+        self.assertTrue(self.st["breaker"]["degradedSent"])
+        with mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.breaker_fail(self.st)          # delivered — no re-ring
+        p.assert_not_called()
 
 
 class TestNotifier(SentryTest):
@@ -1014,6 +1033,154 @@ class TestFetchDay(SentryTest):
         with mock.patch.object(sentry.urllib.request, "urlopen",
                                side_effect=OSError("403")):
             self.assertIsNone(sentry.fetch_day(self.st, "AABQI", "2026-08-20"))
+
+
+class TestInstanceName(SentryTest):
+    """Ops alerts name the box they came from; ticket alerts stay clean.
+    Applied inside push() so no call site can get it wrong."""
+
+    def setUp(self):
+        super().setUp()
+        sentry.CFG["channels"]["whatsapp"]["enabled"] = False
+        sentry.CFG["channels"]["ntfy"]["enabled"] = False
+        tg = sentry.CFG["channels"]["telegram"]
+        tg["enabled"] = True
+        tg["extra_chat_ids"] = ["-100999"]
+        sentry.CFG["instance_name"] = "vps-nyc3"
+
+    def sent(self, **push_kw):
+        seen = []
+
+        def fake_urlopen(req, timeout=None):
+            p = json.loads(req.data.decode())
+            seen.append((p["chat_id"], p["text"]))
+            return FakeResp(b'{"ok": true}')
+
+        with mock.patch.object(sentry.urllib.request, "urlopen",
+                               side_effect=fake_urlopen):
+            sentry.push("Sentry degraded", "body", **push_kw)
+        return seen
+
+    def test_ops_alert_title_names_the_instance(self):
+        (chat, text), = self.sent()
+        self.assertEqual(chat, "424242")
+        self.assertIn("Sentry degraded [vps-nyc3]", text)
+
+    def test_ticket_alert_stays_clean_for_you_and_the_channel(self):
+        for chat, text in self.sent(audience="all"):
+            self.assertNotIn("vps-nyc3", text)
+
+    def test_unnamed_instance_leaves_titles_untouched(self):
+        sentry.CFG["instance_name"] = ""
+        (chat, text), = self.sent()
+        self.assertNotIn("[", text.split("\n")[0])
+
+    def test_env_beats_config_beats_hostname(self):
+        base = {"channels": {}, "instance_name": "from-config"}
+        with mock.patch.dict(os.environ, {"INSTANCE_NAME": "from-env"}):
+            self.assertEqual(sentry.apply_env(copy.deepcopy(base))
+                             ["instance_name"], "from-env")
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("INSTANCE_NAME", None)
+            self.assertEqual(sentry.apply_env(copy.deepcopy(base))
+                             ["instance_name"], "from-config")
+            with mock.patch.object(sentry.socket, "gethostname",
+                                   return_value="the-mac.local"):
+                self.assertEqual(sentry.apply_env({"channels": {}})
+                                 ["instance_name"], "the-mac.local")
+
+
+class TestPreflight(SentryTest):
+    """The cutover gate: refusals, blind payloads, zero hits, and a cadence
+    that cannot fit the daily budget must all block the deploy."""
+
+    def run_preflight(self, lastfetches):
+        """Feed fetch_day a scripted sequence; return (exit_code, output)."""
+        seq = iter(lastfetches)
+
+        def fake_fetch(st, venue, date):
+            lf = dict(next(seq), venue=venue, date=date)
+            st["lastFetch"] = lf
+            return {"movies": ["m"]} if lf.get("ok") else None
+
+        out = io.StringIO()
+        with mock.patch.object(sentry, "fetch_day", side_effect=fake_fetch), \
+             mock.patch.object(preflight, "project_budget",
+                               return_value=(100, "  (mocked)")), \
+             contextlib.redirect_stdout(out):
+            rc = preflight.run()
+        return rc, out.getvalue()
+
+    def good(self, hits=1):
+        return {"ok": True, "status": 200, "bytes": 15000, "movies": 3,
+                "hits": hits}
+
+    def test_healthy_endpoint_passes(self):
+        rc, out = self.run_preflight([self.good()] * 4)
+        self.assertEqual(rc, 0)
+        self.assertIn("PREFLIGHT PASS", out)
+
+    def test_refusal_fails_and_names_the_ip(self):
+        rc, out = self.run_preflight(
+            [self.good(),
+             {"ok": False, "error": "HTTP Error 403: Forbidden"},
+             self.good(), self.good()])
+        self.assertEqual(rc, 1)
+        self.assertIn("REFUSED", out)
+        self.assertIn("blocked", out)
+
+    def test_blind_payload_fails(self):
+        rc, out = self.run_preflight(
+            [dict(self.good(), movies=0, hits=0)] + [self.good()] * 3)
+        self.assertEqual(rc, 1)
+        self.assertIn("BLIND", out)
+
+    def test_zero_hits_across_all_dates_fails(self):
+        rc, out = self.run_preflight([self.good(hits=0)] * 4)
+        self.assertEqual(rc, 1)
+        self.assertIn("PREFLIGHT FAIL", out)
+
+    def test_sampled_dates_stay_inside_the_reconcile_window(self):
+        dates = preflight.sample_dates()
+        today = dt.date.today()
+        for d in dates:
+            offset = (dt.date.fromisoformat(d) - today).days
+            self.assertGreaterEqual(offset, 1)
+            self.assertLessEqual(offset, sentry.CFG["reconcile_days"])
+        self.assertEqual(len(dates), len(set(dates)))
+
+    def laptop_cadence(self, targets):
+        """The production config: every tier at 30s."""
+        sentry.CFG.update(base_interval_seconds=30,
+                          overnight_interval_seconds=30,
+                          burst_interval_seconds=30, burst_windows=[],
+                          target_every_seconds=30, restock_watch_dates=[],
+                          daily_request_budget=15000, target_dates=targets)
+
+    def test_budget_projection_blocks_five_targets_at_30s(self):
+        self.laptop_cadence(["2026-08-2%d" % i for i in range(1, 6)])
+        total, _ = preflight.project_budget()
+        self.assertGreater(total, 15000)
+
+    def test_budget_projection_allows_three_targets_at_30s(self):
+        self.laptop_cadence(["2026-08-21", "2026-08-22", "2026-08-26"])
+        total, _ = preflight.project_budget()
+        self.assertLessEqual(total, 15000)
+
+    def test_over_budget_config_fails_the_run(self):
+        self.laptop_cadence(["2026-08-2%d" % i for i in range(1, 6)])
+        seq = [self.good()] * 4
+
+        def fake_fetch(st, venue, date):
+            st["lastFetch"] = dict(seq.pop(0), venue=venue, date=date)
+            return {"movies": ["m"]}
+
+        out = io.StringIO()
+        with mock.patch.object(sentry, "fetch_day", side_effect=fake_fetch), \
+             contextlib.redirect_stdout(out):
+            rc = preflight.run()
+        self.assertEqual(rc, 1)
+        self.assertIn("exceeds daily_request_budget", out.getvalue())
 
 
 if __name__ == "__main__":

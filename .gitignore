@@ -6,3 +6,8 @@ last_response.json
 watchdog_state.json
 .sentry.lock
 startup.log
+# the VPS keeps its bot token here; it must never reach the remote
+.env
+# compose bind mount: state, logs, lock and the daily snapshots
+data/
+snapshots/
