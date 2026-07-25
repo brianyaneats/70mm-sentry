@@ -236,11 +236,44 @@ response telemetry + blind-streak alerting, and watchdog liveness
   unsuitable for sporadic alerts. Dominated at this volume — skip.
 - **Email→SMS carrier gateways** — dying tech, silently unreliable; skip.
 
+## launchd jobs (macOS)
+
+Three agents in `~/Library/LaunchAgents`, all with `RunAtLoad`, so they come
+back on their own at every login:
+
+| Label | Cadence | Job |
+|---|---|---|
+| `com.brianyan.70mm-sentry` | every 10 s | the watcher (self-gates to the configured interval) |
+| `com.brianyan.70mm-sentry-watchdog` | every 300 s | liveness alarm |
+| `com.brianyan.70mm-sentry-startup` | once per login | proves the other two came back |
+
+`startup_check.py` is the login-time proof. launchd already relaunches the
+jobs — this is what *tells you it worked*, since a boot-time failure (broken
+interpreter, unreadable config, network not up yet) would otherwise sit
+unnoticed until the watchdog's staleness threshold expires ~10 min later. It
+re-bootstraps any job that failed to load, forces one real poll to prove the
+whole path end to end, and reports: silent "Sentry armed at startup" when
+healthy, urgent **SENTRY DID NOT COME BACK** when not. The live poll is
+retried 5× at 15 s intervals because Wi-Fi is usually not up yet at login,
+and an alert that cried wolf every boot would train you to ignore it.
+
+The plists are not versioned here — they carry absolute paths. Each is a
+`ProgramArguments` shell wrapper that picks the first working interpreter
+(`/opt/homebrew/bin/python3`, then `/usr/bin/python3`, …) rather than
+hardcoding one, so an interpreter break cannot take down the watcher and its
+alarms together.
+
 ## Operate
 
 ```bash
 # run once now (skips jitter/overnight gate)
 SENTRY_NOW=1 python3 ~/Developer/70mm-sentry/sentry.py
+
+# confirm everything is running and armed (also repairs missing jobs)
+python3 ~/Developer/70mm-sentry/startup_check.py
+
+# health snapshot
+python3 ~/Developer/70mm-sentry/sentry.py --status
 
 # watch it work
 tail -f ~/Developer/70mm-sentry/sentry.log

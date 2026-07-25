@@ -5,3 +5,4 @@ __pycache__/
 last_response.json
 watchdog_state.json
 .sentry.lock
+startup.log
