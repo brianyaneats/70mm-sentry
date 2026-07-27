@@ -74,6 +74,7 @@ def apply_env(cfg):
 CFG = apply_env(json.load(open(CONFIG_PATH)))
 
 
+HISTORY_PATH = os.path.join(DATA, "history.jsonl")
 LOCK_PATH = os.path.join(DATA, ".sentry.lock")
 _LOCK_FH = None
 
@@ -149,6 +150,8 @@ def default_state():
         "targetLastPoll": {},
         "announced": [],
         "restockAlerted": [],
+        "histSeen": {},
+        "studyLastPoll": {},
     }
 
 
@@ -304,10 +307,12 @@ def fetch_day(st, venue, date):
         return None
 
     movies = vm.get("movies") or []
+    hits = odyssey_70mm(vm)
+    record_history(st, venue, date, hits)
     st["lastFetch"] = {"at": dt.datetime.now().isoformat(), "ok": True,
                        "venue": venue, "date": date, "status": status,
                        "bytes": len(body), "movies": len(movies),
-                       "hits": len(odyssey_70mm(vm))}
+                       "hits": len(hits)}
     # a theater page listing zero movies is not a normal response — it means
     # the endpoint changed, is soft-failing, or is rejecting us politely
     if movies:
@@ -325,6 +330,75 @@ def fetch_day(st, venue, date):
         except Exception as e:
             log(f"response capture failed: {e}")
     return vm
+
+
+def record_history(st, venue, date, hits):
+    """Append availability transitions to history.jsonl. Called from fetch_day,
+    so every poll on every path contributes and no request is spent for data
+    collection alone. Only *changes* are written — the full state at any
+    instant is reconstructable from first sightings plus transitions.
+
+    Uses its own last-seen map (histSeen), deliberately not seenAvailability:
+    that one is alerting bookkeeping written at different points in the cycle,
+    and sharing it would couple recording order to alerting order."""
+    if not CFG.get("history_enabled", True) or not hits:
+        return
+    seen = st.setdefault("histSeen", {})
+    now_iso = dt.datetime.now().isoformat(timespec="seconds")
+    rows = []
+    for h in hits:
+        if not slot_qualifies(h["time"]):
+            continue
+        key = f"{venue}|{date}|{h['time']}"
+        prev = seen.get(key)
+        if prev == h["type"]:
+            continue
+        seen[key] = h["type"]
+        rows.append({"at": now_iso, "venue": venue, "date": date,
+                     "time": h["time"], "from": prev, "to": h["type"]})
+    if not rows:
+        return
+    try:
+        rotate_history()
+        with open(HISTORY_PATH, "a") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+    except Exception as e:  # data collection must never break the watcher
+        try:
+            log(f"history write failed: {e}")
+        except Exception:
+            pass  # whatever broke the append (a full disk) also breaks the log
+
+
+def rotate_history():
+    cap = CFG.get("history_max_bytes", 20_000_000)
+    try:
+        if os.path.getsize(HISTORY_PATH) >= cap:
+            os.replace(HISTORY_PATH, HISTORY_PATH + ".1")
+    except FileNotFoundError:
+        pass
+
+
+def study_due_dates(st, now):
+    """Currently-listed dates sampled purely to learn how refunds behave.
+    They are NOT alerted on — target_dates own the alerting. Bounded by
+    study_days and a relaxed clock so the dataset costs little budget."""
+    n = CFG.get("study_days", 0)
+    if not n:
+        return []
+    interval = CFG.get("study_every_seconds", 600)
+    today = now.date()
+    horizon = min(dt.date.fromisoformat(h) for h in st["horizon"].values())
+    due = []
+    for i in range(n):
+        d = today + dt.timedelta(days=i)
+        if d > horizon:  # not listed yet — nothing to observe
+            break
+        iso = d.isoformat()
+        last = st.setdefault("studyLastPoll", {}).get(iso)
+        if not last or elapsed_seconds(now, last) >= interval * 0.9:
+            due.append(iso)
+    return due
 
 
 def maybe_blind_alert(st):
@@ -1023,6 +1097,11 @@ def main():
             d: t for d, t in st["restockLastPoll"].items() if d >= today}
         st["targetLastPoll"] = {
             d: t for d, t in st["targetLastPoll"].items() if d >= today}
+        st["studyLastPoll"] = {
+            d: t for d, t in st.get("studyLastPoll", {}).items()
+            if d >= today}
+        st["histSeen"] = {k: v for k, v in st.get("histSeen", {}).items()
+                          if k.split("|")[1] >= today}
         heartbeat(st)
         save_state(st)
         snapshot_state(st)
@@ -1079,6 +1158,19 @@ def main():
         for d in due:
             st["restockLastPoll"][d] = now.isoformat()
 
+    # study sampling: observe already-listed dates purely to build the refund
+    # dataset. fetch_day records the transitions; nothing here alerts.
+    for d in study_due_dates(st, now):
+        for venue in CFG["venues"]:
+            vm = fetch_day(st, venue, d)
+            if vm is BUDGET:
+                break
+            if vm is None:
+                breaker_fail(st)
+                break
+            breaker_success(st)
+        st["studyLastPoll"][d] = now.isoformat()
+
     heartbeat(st)
     save_state(st)
 
@@ -1108,6 +1200,13 @@ def status():
     hb_age = "never" if not hb else f"last hb {int(time.time() - hb)}s ago"
     print(f"deadman:      "
           f"{'armed, ' + hb_age if CFG.get('heartbeat_topic') else '(NOT SET)'}")
+    try:
+        n = sum(1 for _ in open(HISTORY_PATH))
+    except Exception:
+        n = 0
+    print(f"history:      {n} transitions "
+          f"({'on' if CFG.get('history_enabled', True) else 'OFF'}, "
+          f"studying {CFG.get('study_days', 0)} days)")
     print(f"digest:       "
           f"{CFG.get('daily_digest_hour', '(off)')} (last: "
           f"{st.get('lastDigest') or 'never'})")

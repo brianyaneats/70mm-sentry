@@ -11,3 +11,5 @@ startup.log
 # compose bind mount: state, logs, lock and the daily snapshots
 data/
 snapshots/
+history.jsonl
+history.jsonl.1

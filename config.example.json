@@ -77,5 +77,9 @@
   "daily_digest_hour": 8,
   "movie_exclude": [
     "space odyssey"
-  ]
+  ],
+  "history_enabled": true,
+  "history_max_bytes": 20000000,
+  "study_days": 7,
+  "study_every_seconds": 600
 }

@@ -1521,3 +1521,112 @@ class TestTelegramSetupGuard(SentryTest):
         sentry.CFG["channels"]["telegram"]["token"] = "T"
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(self._run(pick="424242"), 1)
+
+
+class TestHistoryRecorder(SentryTest):
+    def setUp(self):
+        super().setUp()
+        fd, self.hist = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        os.unlink(self.hist)  # start absent, like a fresh install
+        self.p = mock.patch.object(sentry, "HISTORY_PATH", self.hist)
+        self.p.start()
+
+    def tearDown(self):
+        self.p.stop()
+        for f in (self.hist, self.hist + ".1"):
+            if os.path.exists(f):
+                os.unlink(f)
+        super().tearDown()
+
+    def rows(self):
+        if not os.path.exists(self.hist):
+            return []
+        return [json.loads(l) for l in open(self.hist) if l.strip()]
+
+    def test_first_sighting_then_only_changes(self):
+        hits = [{"time": "6:00p", "type": "soldout"}]
+        sentry.record_history(self.st, "AABQI", "2026-08-15", hits)
+        sentry.record_history(self.st, "AABQI", "2026-08-15", hits)  # no change
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertIsNone(rows[0]["from"])
+        self.assertEqual(rows[0]["to"], "soldout")
+
+    def test_flip_is_recorded_with_previous_status(self):
+        sentry.record_history(self.st, "AABQI", "2026-08-15",
+                              [{"time": "6:00p", "type": "soldout"}])
+        sentry.record_history(self.st, "AABQI", "2026-08-15",
+                              [{"time": "6:00p", "type": "available"}])
+        rows = self.rows()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual((rows[1]["from"], rows[1]["to"]),
+                         ("soldout", "available"))
+
+    def test_respects_slot_filter(self):
+        sentry.CFG["target_dates"] = ["2026-08-21"]  # enables slot_qualifies
+        sentry.CFG["target_after_hour"] = 18
+        sentry.record_history(self.st, "AABQI", "2026-08-21",
+                              [{"time": "10:00a", "type": "available"},
+                               {"time": "7:00p", "type": "available"}])
+        self.assertEqual([r["time"] for r in self.rows()], ["7:00p"])
+
+    def test_disabled_by_config(self):
+        sentry.CFG["history_enabled"] = False
+        sentry.record_history(self.st, "AABQI", "2026-08-15",
+                              [{"time": "6:00p", "type": "soldout"}])
+        self.assertEqual(self.rows(), [])
+
+    def test_write_failure_never_raises(self):
+        with mock.patch("builtins.open", side_effect=OSError("disk full")):
+            sentry.record_history(self.st, "AABQI", "2026-08-15",
+                                  [{"time": "6:00p", "type": "soldout"}])
+
+    def test_rotates_at_cap(self):
+        sentry.CFG["history_max_bytes"] = 10
+        with open(self.hist, "w") as f:
+            f.write("x" * 50)
+        sentry.record_history(self.st, "AABQI", "2026-08-15",
+                              [{"time": "6:00p", "type": "soldout"}])
+        self.assertTrue(os.path.exists(self.hist + ".1"))
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_fetch_day_records_without_extra_requests(self):
+        body = json.dumps({"viewModel": viewmodel(
+            [showtime(type_="soldout")])}).encode()
+        with mock.patch.object(sentry.urllib.request, "urlopen",
+                               return_value=FakeResp(body)) as u:
+            sentry.fetch_day(self.st, "AABQI", "2026-08-15")
+        self.assertEqual(u.call_count, 1)      # no second fetch for history
+        self.assertEqual(len(self.rows()), 1)
+
+
+class TestStudyDates(SentryTest):
+    def setUp(self):
+        super().setUp()
+        self.now = dt.datetime(2026, 7, 26, 12, 0).astimezone()
+        self.st["horizon"]["AABQI"] = "2026-07-28"
+
+    def test_disabled_when_study_days_zero(self):
+        sentry.CFG["study_days"] = 0
+        self.assertEqual(sentry.study_due_dates(self.st, self.now), [])
+
+    def test_stops_at_horizon(self):
+        sentry.CFG["study_days"] = 7
+        self.assertEqual(sentry.study_due_dates(self.st, self.now),
+                         ["2026-07-26", "2026-07-27", "2026-07-28"])
+
+    def test_respects_interval(self):
+        sentry.CFG["study_days"] = 2
+        sentry.CFG["study_every_seconds"] = 600
+        self.st["studyLastPoll"]["2026-07-26"] = self.now.isoformat()
+        self.assertEqual(sentry.study_due_dates(self.st, self.now),
+                         ["2026-07-27"])
+
+    def test_due_again_once_interval_elapsed(self):
+        sentry.CFG["study_days"] = 1
+        sentry.CFG["study_every_seconds"] = 600
+        self.st["studyLastPoll"]["2026-07-26"] = (
+            self.now - dt.timedelta(minutes=11)).isoformat()
+        self.assertEqual(sentry.study_due_dates(self.st, self.now),
+                         ["2026-07-26"])

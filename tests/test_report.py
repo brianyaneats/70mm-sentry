@@ -1,0 +1,107 @@
+"""Unit tests for the availability replay report. No network, no real files."""
+
+import datetime as dt
+import json
+import os
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import report  # noqa: E402
+import sentry  # noqa: E402
+
+
+def ev(mins_ago, time_="6:00p", frm=None, to="soldout", date="2026-08-15"):
+    at = (dt.datetime.now() - dt.timedelta(minutes=mins_ago))
+    return {"at": at.isoformat(timespec="seconds"), "venue": "AABQI",
+            "date": date, "time": time_, "from": frm, "to": to}
+
+
+class TestLoadEvents(unittest.TestCase):
+    def test_skips_torn_lines_and_sorts(self):
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        with open(path, "w") as f:
+            f.write(json.dumps(ev(10)) + "\n")
+            f.write("{not json\n")
+            f.write("\n")
+            f.write(json.dumps(ev(90)) + "\n")
+        try:
+            rows = report.load_events(path)
+        finally:
+            os.unlink(path)
+        self.assertEqual(len(rows), 2)
+        self.assertLess(rows[0]["at"], rows[1]["at"])
+
+    def test_missing_file_is_empty(self):
+        self.assertEqual(report.load_events("/nonexistent/history.jsonl"), [])
+
+
+class TestAnalyze(unittest.TestCase):
+    def test_empty_returns_none(self):
+        self.assertIsNone(report.analyze([]))
+
+    def test_counts_reopenings_takings_and_survival(self):
+        rows = [ev(180), ev(120, frm="soldout", to="available"),
+                ev(90, frm="available", to="soldout")]
+        a = report.analyze(rows)
+        t = a["totals"]
+        self.assertEqual(t["opened"], 1)
+        self.assertEqual(t["taken"], 1)
+        self.assertEqual(t["survivalSamples"], 1)
+        self.assertAlmostEqual(t["medianSurvivalMin"], 30, delta=1)
+
+    def test_first_sighting_is_not_counted_as_churn(self):
+        a = report.analyze([ev(60, to="available")])
+        self.assertEqual(a["totals"]["opened"], 0)
+
+    def test_grid_carries_state_forward_to_end(self):
+        a = report.analyze([ev(120), ev(60, frm="soldout", to="available")])
+        self.assertEqual(a["grid"][0][-1], "a")
+        self.assertEqual(a["grid"][0][0], "s")
+
+    def test_slots_and_dates_deduped(self):
+        rows = [ev(60, time_="6:00p"), ev(50, time_="9:00p"),
+                ev(40, time_="6:00p", date="2026-08-16")]
+        a = report.analyze(rows)
+        self.assertEqual(a["totals"]["slots"], 3)
+        self.assertEqual(a["totals"]["dates"], 2)
+
+
+class TestRender(unittest.TestCase):
+    def _render(self, rows):
+        return report.render(report.analyze(rows), sentry.CFG)
+
+    def test_self_contained_and_ascii_safe(self):
+        html = self._render([ev(120), ev(60, frm="soldout", to="available")])
+        markup = html.split("<script>")[0]
+        self.assertFalse(any(ord(c) > 127 for c in markup))
+        for bad in ("http://", "https://", "<img", "@import"):
+            self.assertNotIn(bad, html)
+
+    def test_empty_state_is_honest_not_broken(self):
+        html = report.render(None, sentry.CFG)
+        self.assertIn("Collecting", html)
+        self.assertNotIn("Traceback", html)
+
+    def test_theme_aware_both_directions(self):
+        html = self._render([ev(60)])
+        self.assertIn("prefers-color-scheme:dark", html)
+        self.assertIn(':root[data-theme=dark]', html)
+        self.assertIn(':root[data-theme=light]', html)
+
+    def test_fade_is_opt_in_so_no_js_still_shows_content(self):
+        html = self._render([ev(60)])
+        self.assertIn(".js .fade{opacity:0", html)
+        self.assertIn("classList.add('js')", html)
+
+    def test_scrubber_matches_bucket_count(self):
+        html = self._render([ev(120), ev(60, frm="soldout", to="available")])
+        self.assertIn(f'max="{report.BUCKETS - 1}"', html)
+        self.assertEqual(html.count('class="bar"'), report.BUCKETS)
+
+
+if __name__ == "__main__":
+    unittest.main()
