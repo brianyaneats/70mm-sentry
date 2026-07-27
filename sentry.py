@@ -335,6 +335,31 @@ def napi_headers(venue):
             "Accept-Language": "en-US,en;q=0.9"}
 
 
+_LAST_REQUEST_AT = 0.0
+
+
+def pace_request():
+    """Hold every request to Fandango's own published rate guidance.
+
+    Fandango publishes no limits for the public site — no RateLimit headers,
+    no Crawl-delay in robots.txt — but their sanctioned partner API documents
+    **1 call per second**. That is the only number they have ever published
+    about acceptable request rates, so it is the ceiling worth respecting.
+
+    Enforced here, at the single choke point every path shares, because
+    average rate was never the risk: a burst of back-to-back requests is the
+    behavioural shape bot detection keys on, and target/restock checks
+    iterate dates with no spacing of their own. flock guarantees one cycle at
+    a time, so a process-local pacer is effectively global.
+    """
+    global _LAST_REQUEST_AT
+    gap = CFG.get("min_request_spacing_seconds", 1.0)
+    wait = gap - (time.time() - _LAST_REQUEST_AT)
+    if wait > 0:
+        time.sleep(wait)
+    _LAST_REQUEST_AT = time.time()
+
+
 def budget_gate(st):
     """True when a request may be spent. Alerts once a day on exhaustion."""
     if budget_ok(st):
@@ -360,6 +385,7 @@ def fetch_day(st, venue, date, session=None):
     polling affordable."""
     if not budget_gate(st):
         return BUDGET
+    pace_request()
     budget_spend(st)
     try:
         if session is not None:

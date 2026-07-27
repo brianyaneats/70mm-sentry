@@ -1861,3 +1861,54 @@ class TestRealtimeSession(SentryTest):
         self.assertTrue(self.st["lastFetch"]["ok"])
         self.assertEqual(self.st["budget"]["spent"], 1)
         session.get.assert_called_once_with("AABQI", "2026-08-20")
+
+
+class TestRequestPacing(SentryTest):
+    """Fandango publishes no public limit, but their partner API documents
+    1 call/second. Every path shares one choke point that enforces it, since
+    bursts — not averages — are what bot detection reacts to."""
+
+    def setUp(self):
+        super().setUp()
+        sentry._LAST_REQUEST_AT = 0.0
+        sentry.CFG["min_request_spacing_seconds"] = 1.0
+
+    def test_back_to_back_requests_are_spaced(self):
+        slept = []
+        with mock.patch.object(sentry.time, "sleep", slept.append):
+            sentry.pace_request()
+            sentry._LAST_REQUEST_AT = sentry.time.time()  # pretend one landed
+            sentry.pace_request()
+        self.assertTrue(slept, "second request was not paced")
+        self.assertGreater(slept[-1], 0.5)
+
+    def test_no_wait_once_the_gap_has_already_passed(self):
+        sentry._LAST_REQUEST_AT = sentry.time.time() - 5
+        slept = []
+        with mock.patch.object(sentry.time, "sleep", slept.append):
+            sentry.pace_request()
+        self.assertEqual(slept, [])
+
+    def test_every_fetch_goes_through_the_pacer(self):
+        body = json.dumps({"viewModel": viewmodel([showtime()])}).encode()
+        with mock.patch.object(sentry, "pace_request") as pace, \
+                mock.patch.object(sentry.urllib.request, "urlopen",
+                                  return_value=FakeResp(body)):
+            sentry.fetch_day(self.st, "AABQI", "2026-08-20")
+        pace.assert_called_once()
+
+    def test_budget_refusal_costs_no_pacing_delay(self):
+        sentry.budget_ok(self.st)
+        self.st["budget"]["spent"] = sentry.CFG["daily_request_budget"]
+        with mock.patch.object(sentry, "pace_request") as pace, \
+                mock.patch.object(sentry, "push", return_value=True):
+            sentry.fetch_day(self.st, "AABQI", "2026-08-20")
+        pace.assert_not_called()
+
+    def test_spacing_is_configurable(self):
+        sentry.CFG["min_request_spacing_seconds"] = 0
+        sentry._LAST_REQUEST_AT = sentry.time.time()
+        slept = []
+        with mock.patch.object(sentry.time, "sleep", slept.append):
+            sentry.pace_request()
+        self.assertEqual(slept, [])

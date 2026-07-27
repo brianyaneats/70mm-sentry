@@ -91,5 +91,6 @@
       "end_hour": 12,
       "interval_seconds": 6
     }
-  ]
+  ],
+  "min_request_spacing_seconds": 1.0
 }
