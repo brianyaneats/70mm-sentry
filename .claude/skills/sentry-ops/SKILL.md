@@ -98,6 +98,14 @@ an Xcode install once broke `/usr/bin/python3` and killed polling silently.
 4. **Drills:** anything that can reach a real channel must be TEST-labeled
    and silent (`disable_notification`), and never leave an alarm un-cleared.
    Never test-fire against the friends broadcast channel.
+4b. **Every writable path the suite can reach must be redirected in
+   `SentryTest.setUp`** (currently `LOG_PATH` and `HISTORY_PATH`). `fetch_day`
+   records history as a side effect, so any test mocking `urlopen` rather than
+   `fetch_day` writes wherever the module constant points — this silently
+   appended 16 fabricated rows to the production `history.jsonl` on
+   2026-07-27. Two regression tests now assert the paths sit outside the repo
+   and that a recording fetch leaves the real file untouched; when adding any
+   new file the watcher writes, redirect it there too.
 5. To simulate a drop: set a venue horizon back a week in state.json, run
    `SENTRY_NOW=1`, then clean `alerted`/`dropLog`/`announced` afterward.
 6. Waiting on a daemon cycle: background task/Monitor — never `sleep && tail`.
