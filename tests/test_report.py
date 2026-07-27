@@ -131,3 +131,31 @@ class TestFindingBlock(unittest.TestCase):
     def test_not_claimed_on_a_thin_sample(self):
         html = self._html([ev(60), ev(30)])
         self.assertNotIn("What this feed can and cannot see", html)
+
+
+class TestStatHonesty(unittest.TestCase):
+    """Stats must claim only what was measured: a flip to on-sale is not
+    proof of a refund, and one observation is not a median."""
+
+    def test_single_sample_is_not_called_a_median(self):
+        rows = [ev(180), ev(120, frm="soldout", to="available"),
+                ev(90, frm="available", to="soldout")]
+        html = report.render(report.analyze(rows), sentry.CFG)
+        self.assertIn("too few to average", html)
+        self.assertNotIn("median time back on sale", html)
+        self.assertNotIn("1 observations", html)  # plural agreement
+
+    def test_median_claimed_once_samples_support_it(self):
+        rows = [ev(300)]
+        for i in range(3):
+            rows.append(ev(200 - i * 40, time_=f"{i + 1}:00p",
+                           frm="soldout", to="available"))
+            rows.append(ev(190 - i * 40, time_=f"{i + 1}:00p",
+                           frm="available", to="soldout"))
+        html = report.render(report.analyze(rows), sentry.CFG)
+        self.assertIn("median time back on sale", html)
+
+    def test_does_not_assert_refunds_were_seen(self):
+        html = report.render(report.analyze([ev(60), ev(30)]), sentry.CFG)
+        self.assertIn("flips to on sale", html)
+        self.assertNotIn("refunds seen", html)

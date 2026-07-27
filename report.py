@@ -310,15 +310,22 @@ def render(a, cfg):
             f'</div>'))
 
     t = a["totals"]
-    surv = (f'{t["medianSurvivalMin"]} min' if t["medianSurvivalMin"] is not None
-            else "—")
+    # name what was actually measured: a flip to on-sale is not proof of a
+    # refund, and one observation is not a median
+    ns = t["survivalSamples"]
+    surv = (f'{t["medianSurvivalMin"]} min' if ns >= 3
+            else (f'{t["medianSurvivalMin"]} min' if ns else "—"))
+    surv_label = ("median time back on sale" if ns >= 3
+                  else f'time on sale ({ns} observation'
+                       f'{"s" if ns != 1 else ""} — too few to average)'
+                  if ns else "no on-sale spells observed")
     stats = "".join(
         f'<div class="stat"><div class="n">{esc(n)}</div>'
         f'<div class="k">{esc(k)}</div></div>'
         for n, k in [
-            (t["opened"], "seats reopened (refunds seen)"),
-            (t["taken"], "reopened seats taken"),
-            (surv, f'median time before taken ({t["survivalSamples"]} samples)'),
+            (t["opened"], "flips to on sale"),
+            (t["taken"], "flips back off sale"),
+            (surv, surv_label),
             (f'{a["hours"]}h', f'observed · {t["slots"]} showtimes'),
         ])
 
@@ -381,9 +388,9 @@ def render(a, cfg):
 <p class="eyebrow">Availability study · {esc(venue)}</p>
 <h1>What sold out really means.</h1>
 <p class="lede">Every {esc(str(sentry.CFG.get("study_every_seconds", 600) // 60))}
-minutes the watcher re-reads the showtimes it can see and records only what
-changed. This is {esc(a["hours"])} hours of that record: when seats came back,
-and how long they lasted.</p>
+minutes the watcher re-reads every showtime it can see and records only what
+changed. This is {esc(a["hours"])} hours of that record — and the most useful
+thing in it is what never moves.</p>
 <div class="stats">{stats}</div>
 
 <div class="card fade">
