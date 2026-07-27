@@ -105,3 +105,29 @@ class TestRender(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestFindingBlock(unittest.TestCase):
+    """The 'this feed cannot see sellouts' conclusion must be evidence-driven:
+    it appears only while the data supports it and retracts itself if a real
+    sellout ever shows up."""
+
+    def _html(self, rows):
+        return report.render(report.analyze(rows), sentry.CFG)
+
+    def _many(self, to="available"):
+        return [ev(100 - i, time_=f"{i}:00p", to=to) for i in range(1, 7)]
+
+    def test_shown_when_nothing_ever_sold_out(self):
+        html = self._html(self._many())
+        self.assertIn("What this feed can and cannot see", html)
+        self.assertIn("new dates going on", html)
+
+    def test_retracts_itself_once_a_sellout_appears(self):
+        rows = self._many()
+        rows.append(ev(5, time_="1:00p", frm="available", to="soldout"))
+        self.assertNotIn("What this feed can and cannot see", self._html(rows))
+
+    def test_not_claimed_on_a_thin_sample(self):
+        html = self._html([ev(60), ev(30)])
+        self.assertNotIn("What this feed can and cannot see", html)

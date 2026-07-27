@@ -12,6 +12,7 @@ with no external requests — safe to publish as an artifact.
 """
 
 import argparse
+import collections
 import datetime as dt
 import json
 import os
@@ -127,6 +128,9 @@ def analyze(rows):
             "events": len(events),
             "opened": sum(opened), "taken": sum(taken),
             "slots": len(slots), "dates": len(dates),
+            "statuses": dict(collections.Counter(
+                e["to"] for e in events)),
+            "everSoldout": any(e["to"] == "soldout" for e in events),
             "medianSurvivalMin": (round(statistics.median(survival) / 60, 1)
                                   if survival else None),
             "fastestSurvivalMin": (round(min(survival) / 60, 1)
@@ -346,6 +350,28 @@ def render(a, cfg):
         f'<i style="height:{a["byHour"][h] / hpeak * 60:.1f}px"></i>'
         f'<span>{h if h % 3 == 0 else ""}</span></div>' for h in range(24))
 
+    # the finding is computed, never asserted: if this feed ever does show a
+    # sellout, the page says so instead and the caveat disappears on its own
+    if not t["everSoldout"] and t["slots"] >= 5:
+        seen = ", ".join(f"{esc(k)} ({v})" for k, v in
+                         sorted(t["statuses"].items(), key=lambda x: -x[1]))
+        finding = (
+            f'<div class="card fade"><div class="card-head">'
+            f'<h2>What this feed can and cannot see</h2></div>'
+            f'<p class="lede" style="max-width:640px">Across {t["slots"]} '
+            f'showtimes over {a["hours"]} hours, not one has ever reported '
+            f'<em>sold out</em>. Observed states: {seen}. Public listings mark '
+            f'a showtime on sale, not whether a seat is left — so a house with '
+            f'zero seats and a house with fifty look identical here.</p>'
+            f'<p class="lede" style="max-width:640px;margin-top:12px">'
+            f'Consequence worth being blunt about: refunds cannot be detected '
+            f'from this data. Watching for <strong>new dates going on '
+            f'sale</strong> — where a whole auditorium opens at once — is the '
+            f'mechanism that actually works. Per-seat detection needs '
+            f'seat-level access this feed does not carry.</p></div>')
+    else:
+        finding = ""
+
     best = max(range(24), key=lambda h: a["byHour"][h])
     hour_note = (f'Most reopenings seen around <strong>{best}:00 '
                  f'{esc(a["tz"].split("/")[-1].replace("_", " "))}</strong>.'
@@ -381,6 +407,7 @@ and how long they lasted.</p>
  <div class="map">{"".join(groups)}</div>
 </div>
 
+{finding}
 <div class="card fade">
  <div class="card-head"><h2>When refunds land</h2>
   <span class="sub">reopenings by hour, {esc(a["tz"])}</span></div>
