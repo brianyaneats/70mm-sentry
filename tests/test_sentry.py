@@ -1688,3 +1688,176 @@ class TestSuiteDoesNotTouchProductionData(SentryTest):
         after = os.path.getsize(real) if os.path.exists(real) else None
         self.assertEqual(before, after)
         self.assertTrue(os.path.getsize(sentry.HISTORY_PATH) > 0)
+
+
+RT_WINDOW = [{"days": ["Tue"], "start_hour": 6, "end_hour": 12,
+              "interval_seconds": 6}]
+
+
+def et(y, m, d, h, minute=0):
+    """A wall-clock moment in the theater's timezone."""
+    return dt.datetime(y, m, d, h, minute,
+                       tzinfo=zoneinfo.ZoneInfo("America/New_York"))
+
+
+class TestRealtimeWindow(SentryTest):
+    def setUp(self):
+        super().setUp()
+        sentry.CFG["realtime_windows"] = RT_WINDOW
+        sentry.CFG["schedule_tz"] = "America/New_York"
+
+    def test_inside_tuesday_morning(self):
+        self.assertEqual(sentry.realtime_interval(et(2026, 7, 28, 6, 0)), 6)
+        self.assertEqual(sentry.realtime_interval(et(2026, 7, 28, 11, 59)), 6)
+
+    def test_outside_by_hour_and_by_day(self):
+        self.assertIsNone(sentry.realtime_interval(et(2026, 7, 28, 5, 59)))
+        self.assertIsNone(sentry.realtime_interval(et(2026, 7, 28, 12, 0)))
+        self.assertIsNone(sentry.realtime_interval(et(2026, 7, 29, 8, 0)))
+
+    def test_evaluated_in_theater_time_not_host_time(self):
+        # 06:30 ET is 03:30 PT — a host-clock check would miss the window
+        pacific = et(2026, 7, 28, 6, 30).astimezone(
+            zoneinfo.ZoneInfo("America/Los_Angeles"))
+        self.assertEqual(pacific.hour, 3)
+        self.assertEqual(sentry.realtime_interval(pacific), 6)
+
+    def test_survives_a_dst_shift(self):
+        # first Tuesday after the 2026 fall-back; ET is UTC-5 by then
+        nov = dt.datetime(2026, 11, 3, 7, 0,
+                          tzinfo=zoneinfo.ZoneInfo("America/New_York"))
+        self.assertEqual(nov.strftime("%a"), "Tue")
+        self.assertEqual(sentry.realtime_interval(nov), 6)
+
+    def test_poll_interval_defers_to_realtime(self):
+        self.assertEqual(sentry.poll_interval(et(2026, 7, 28, 7, 0)), 6)
+
+    def test_interval_floor_protects_against_a_typo(self):
+        sentry.CFG["realtime_windows"] = [dict(RT_WINDOW[0],
+                                               interval_seconds=0)]
+        self.assertEqual(sentry.realtime_interval(et(2026, 7, 28, 7, 0)), 3)
+
+    def test_seconds_left_counts_down_to_window_close(self):
+        left = sentry.realtime_seconds_left(et(2026, 7, 28, 11, 30))
+        self.assertAlmostEqual(left, 1800, delta=5)
+        self.assertEqual(sentry.realtime_seconds_left(et(2026, 7, 29, 8, 0)), 0)
+
+    def test_no_windows_configured_is_inert(self):
+        sentry.CFG["realtime_windows"] = []
+        self.assertIsNone(sentry.realtime_interval(et(2026, 7, 28, 7, 0)))
+
+
+class TestRealtimeLoop(SentryTest):
+    def setUp(self):
+        super().setUp()
+        sentry.CFG["realtime_windows"] = RT_WINDOW
+        sentry.CFG["schedule_tz"] = "America/New_York"
+        self.now = dt.datetime.now().astimezone()
+
+    # the loop floors its sleep at 0.5s (never poll faster than twice a
+    # second, whatever the config says), so a meaningful slice spans several
+    def _run(self, slice_s=1.8, **patches):
+        with mock.patch.object(sentry, "REALTIME_SLICE", slice_s), \
+                mock.patch.object(sentry, "realtime_interval",
+                                  return_value=patches.pop("interval", 0.05)), \
+                mock.patch.object(sentry, "realtime_seconds_left",
+                                  return_value=9999), \
+                mock.patch.object(sentry, "target_check"), \
+                mock.patch.object(sentry, "heartbeat"), \
+                mock.patch.object(sentry, "save_state"), \
+                mock.patch.object(sentry, "RealtimeSession"), \
+                mock.patch.object(sentry, "probe_once",
+                                  **patches) as probe:
+            sentry.realtime_loop(self.st, self.now)
+        return probe
+
+    def test_polls_repeatedly_within_the_slice(self):
+        probe = self._run(return_value=False)
+        self.assertGreater(probe.call_count, 2)
+
+    def test_updates_last_poll_so_the_watchdog_sees_life(self):
+        self._run(return_value=False)
+        age = sentry.elapsed_seconds(dt.datetime.now().astimezone(),
+                                     self.st["lastPollAt"])
+        self.assertLess(age, 5)
+
+    def test_stops_when_budget_is_exhausted(self):
+        sentry.budget_ok(self.st)
+        self.st["budget"]["spent"] = sentry.CFG["daily_request_budget"]
+        probe = self._run(return_value=False)
+        probe.assert_not_called()
+
+    def test_stops_when_breaker_opens(self):
+        self.st["breaker"] = {"state": "open", "failures": 9,
+                              "openUntil": sentry.time.time() + 999,
+                              "degradedSent": False}
+        probe = self._run(return_value=False)
+        probe.assert_not_called()
+
+    def test_a_drop_persists_state_immediately(self):
+        with mock.patch.object(sentry, "REALTIME_SLICE", 0.2), \
+                mock.patch.object(sentry, "realtime_interval",
+                                  return_value=0.05), \
+                mock.patch.object(sentry, "realtime_seconds_left",
+                                  return_value=9999), \
+                mock.patch.object(sentry, "target_check"), \
+                mock.patch.object(sentry, "heartbeat"), \
+                mock.patch.object(sentry, "RealtimeSession"), \
+                mock.patch.object(sentry, "probe_once", return_value=True), \
+                mock.patch.object(sentry, "save_state") as save:
+            sentry.realtime_loop(self.st, self.now)
+        self.assertGreater(save.call_count, 1)
+
+    def test_session_is_always_closed(self):
+        with mock.patch.object(sentry, "REALTIME_SLICE", 0.1), \
+                mock.patch.object(sentry, "realtime_interval",
+                                  return_value=0.05), \
+                mock.patch.object(sentry, "realtime_seconds_left",
+                                  return_value=9999), \
+                mock.patch.object(sentry, "target_check"), \
+                mock.patch.object(sentry, "heartbeat"), \
+                mock.patch.object(sentry, "save_state"), \
+                mock.patch.object(sentry, "probe_once",
+                                  side_effect=RuntimeError("boom")), \
+                mock.patch.object(sentry, "RealtimeSession") as S:
+            with self.assertRaises(RuntimeError):
+                sentry.realtime_loop(self.st, self.now)
+        S.return_value.close.assert_called_once()
+
+
+class TestRealtimeSession(SentryTest):
+    def test_reuses_one_connection_across_polls(self):
+        with mock.patch.object(sentry.http.client, "HTTPSConnection") as C:
+            C.return_value.getresponse.return_value = mock.Mock(
+                status=200, read=mock.Mock(return_value=b"{}"))
+            s = sentry.RealtimeSession()
+            for _ in range(4):
+                s.get("AABQI", "2026-08-20")
+        self.assertEqual(C.call_count, 1)      # one handshake, four requests
+        self.assertEqual(s.reconnects, 1)
+
+    def test_reconnects_once_after_a_dropped_socket(self):
+        with mock.patch.object(sentry.http.client, "HTTPSConnection") as C:
+            good = mock.Mock(status=200, read=mock.Mock(return_value=b"{}"))
+            C.return_value.getresponse.side_effect = [OSError("closed"), good]
+            s = sentry.RealtimeSession()
+            status, body = s.get("AABQI", "2026-08-20")
+        self.assertEqual((status, body), (200, b"{}"))
+        self.assertEqual(s.reconnects, 2)
+
+    def test_http_error_raises_so_the_breaker_sees_it(self):
+        with mock.patch.object(sentry.http.client, "HTTPSConnection") as C:
+            C.return_value.getresponse.return_value = mock.Mock(
+                status=429, read=mock.Mock(return_value=b"slow down"))
+            with self.assertRaises(Exception):
+                sentry.RealtimeSession().get("AABQI", "2026-08-20")
+
+    def test_fetch_day_through_a_session_keeps_normal_bookkeeping(self):
+        body = json.dumps({"viewModel": viewmodel([showtime()])}).encode()
+        session = mock.Mock()
+        session.get.return_value = (200, body)
+        vm = sentry.fetch_day(self.st, "AABQI", "2026-08-20", session=session)
+        self.assertEqual(len(sentry.odyssey_70mm(vm)), 1)
+        self.assertTrue(self.st["lastFetch"]["ok"])
+        self.assertEqual(self.st["budget"]["spent"], 1)
+        session.get.assert_called_once_with("AABQI", "2026-08-20")

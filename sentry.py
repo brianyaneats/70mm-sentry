@@ -12,6 +12,7 @@ Env flags: SENTRY_NOW=1 skips start jitter and the overnight cadence gate.
 
 import datetime as dt
 import fcntl
+import http.client
 import json
 import os
 import random
@@ -273,32 +274,102 @@ def breaker_success(st):
 BUDGET = object()
 
 
-def fetch_day(st, venue, date):
+class RealtimeSession:
+    """One kept-alive HTTPS connection reused across a burst of polls.
+
+    Fandango exposes no websocket, no SSE, and ignores If-None-Match (verified
+    2026-07-27: an ETag is returned but a conditional GET still answers 200
+    with the full body). Polling is therefore the only transport available;
+    the closest thing to a stream is to stop paying for a TLS handshake on
+    every request. Reconnects silently — a dropped socket is normal.
+    """
+
+    HOST = "www.fandango.com"
+
+    def __init__(self, timeout=12):
+        self.timeout = timeout
+        self.conn = None
+        self.reconnects = 0
+
+    def _connect(self):
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+        self.conn = http.client.HTTPSConnection(self.HOST,
+                                                timeout=self.timeout)
+        self.reconnects += 1
+
+    def get(self, venue, date):
+        path = f"/napi/theaterMovieShowtimes/{venue}?date={date}"
+        for attempt in (1, 2):  # one silent retry: keep-alive sockets die
+            try:
+                if self.conn is None:
+                    self._connect()
+                self.conn.request("GET", path, headers=napi_headers(venue))
+                resp = self.conn.getresponse()
+                body = resp.read()  # must drain to reuse the connection
+                if resp.status >= 400:
+                    raise RuntimeError(f"HTTP {resp.status}")
+                return resp.status, body
+            except Exception:
+                self.conn = None
+                if attempt == 2:
+                    raise
+        raise RuntimeError("unreachable")
+
+    def close(self):
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except Exception:
+                pass
+            self.conn = None
+
+
+def napi_headers(venue):
+    return {"User-Agent": UA,
+            "Referer": CFG["venues"][venue]["referer"],
+            "Accept": "application/json, text/plain, */*",
+            "Accept-Language": "en-US,en;q=0.9"}
+
+
+def budget_gate(st):
+    """True when a request may be spent. Alerts once a day on exhaustion."""
+    if budget_ok(st):
+        return True
+    today = dt.date.today().isoformat()
+    if st.get("budgetAlerted") != today:
+        if push("Sentry budget exhausted",
+                f"Daily request budget ({CFG['daily_request_budget']}) "
+                f"spent; polling pauses until midnight. If a drop is "
+                f"expected, raise daily_request_budget.",
+                priority="default"):
+            st["budgetAlerted"] = today
+    log("daily request budget exhausted; skipping fetch")
+    return False
+
+
+def fetch_day(st, venue, date, session=None):
     """One NAPI request. Returns viewModel dict, None (failure), or BUDGET
-    (self-imposed daily cap reached — not a failure)."""
-    if not budget_ok(st):
-        today = dt.date.today().isoformat()
-        if st.get("budgetAlerted") != today:
-            if push("Sentry budget exhausted",
-                    f"Daily request budget ({CFG['daily_request_budget']}) "
-                    f"spent; polling pauses until midnight. If a drop is "
-                    f"expected, raise daily_request_budget.",
-                    priority="default"):
-                st["budgetAlerted"] = today
-        log("daily request budget exhausted; skipping fetch")
+    (self-imposed daily cap reached — not a failure).
+
+    With a RealtimeSession the request rides an already-open TLS connection —
+    same bookkeeping, one less handshake, which is what makes second-scale
+    polling affordable."""
+    if not budget_gate(st):
         return BUDGET
-    url = NAPI.format(venue=venue, date=date)
-    req = urllib.request.Request(url, headers={
-        "User-Agent": UA,
-        "Referer": CFG["venues"][venue]["referer"],
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.9",
-    })
     budget_spend(st)
     try:
-        with urllib.request.urlopen(req, timeout=25) as r:
-            body = r.read()
-            status = getattr(r, "status", None)
+        if session is not None:
+            status, body = session.get(venue, date)
+        else:
+            url = NAPI.format(venue=venue, date=date)
+            req = urllib.request.Request(url, headers=napi_headers(venue))
+            with urllib.request.urlopen(req, timeout=25) as r:
+                body = r.read()
+                status = getattr(r, "status", None)
         payload = json.loads(body)
         vm = payload["viewModel"]
     except KeyError:
@@ -873,9 +944,39 @@ def schedule_time(now):
         return now
 
 
+def realtime_interval(now):
+    """Seconds between polls inside a realtime window, else None.
+
+    These are the hours a drop is actually expected (reported: Tuesday
+    morning ET for the following weeks' dates), evaluated on the THEATER's
+    clock. Inside one, the watcher stops behaving like a cron job and holds a
+    tight loop on a kept-alive connection."""
+    t = schedule_time(now)
+    for w in CFG.get("realtime_windows", []):
+        if (t.strftime("%a") in w["days"]
+                and w["start_hour"] <= t.hour < w["end_hour"]):
+            return max(3, int(w.get("interval_seconds", 6)))
+    return None
+
+
+def realtime_seconds_left(now):
+    """Seconds until the current realtime window closes (0 if outside one)."""
+    t = schedule_time(now)
+    for w in CFG.get("realtime_windows", []):
+        if (t.strftime("%a") in w["days"]
+                and w["start_hour"] <= t.hour < w["end_hour"]):
+            end = t.replace(hour=0, minute=0, second=0, microsecond=0) \
+                + dt.timedelta(hours=w["end_hour"])
+            return max(0, int((end - t).total_seconds()))
+    return 0
+
+
 def poll_interval(now):
     """Seconds between polls right now. Burst windows (configured drop
     windows) beat the overnight stretch; otherwise base cadence."""
+    rt = realtime_interval(now)
+    if rt:
+        return rt
     t = schedule_time(now)
     for w in CFG.get("burst_windows", []):
         if (t.strftime("%a") in w["days"] and
@@ -919,6 +1020,90 @@ def restock_check(st, venue, dates):
         if push(f"🎟️ Seats just opened — {vcfg['name']}",
                 "\n".join(lines), audience="all"):
             st["restockAlerted"].extend(k for *_, k in freed)
+
+
+REALTIME_SLICE = 55   # seconds of tight looping per invocation
+
+
+def probe_once(st, venue, session=None):
+    """Probe the first date past the horizon. Returns True if a drop was
+    found and handled. Shared by the steady cycle and the realtime loop so
+    both take exactly the same path on the one event that matters."""
+    probe_date = (dt.date.fromisoformat(st["horizon"][venue]) +
+                  dt.timedelta(days=1)).isoformat()
+    vm = fetch_day(st, venue, probe_date, session=session)
+    if vm is BUDGET:
+        return False
+    if vm is None:
+        breaker_fail(st)
+        return False
+    breaker_success(st)
+    hits = odyssey_70mm(vm)
+    if not hits:
+        lf = st.get("lastFetch", {})
+        log(f"quiet {venue}: nothing past {st['horizon'][venue]} "
+            f"[HTTP {lf.get('status')} {lf.get('bytes')}B "
+            f"{lf.get('movies')} movies] "
+            f"(budget {st['budget']['spent']}/{CFG['daily_request_budget']})")
+        return False
+    log(f"PROBE HIT {venue} {probe_date} — sweeping")
+    # ring first, enumerate second: the sweep costs ~a minute and the phone
+    # should already be buzzing while it runs
+    maybe_instant_alert(st, venue, probe_date)
+    save_state(st)
+    dates = [(dt.date.fromisoformat(probe_date) + dt.timedelta(days=i))
+             .isoformat() for i in range(CFG["sweep_days"])]
+    found = scan_dates(st, venue, dates)
+    found.setdefault(probe_date, {
+        "total": len(hits),
+        "open": sum(1 for h in hits if h["type"] == "available"),
+        "times": [h["time"] for h in hits if h["type"] == "available"]})
+    handle_drop(st, venue, found)
+    return True
+
+
+def realtime_loop(st, now):
+    """Tight polling for the hours a drop is actually expected.
+
+    Fandango offers no push transport — no websocket, no SSE, and it ignores
+    If-None-Match — so the only way to shorten detection latency is to ask
+    more often over a connection that is already open. One invocation holds
+    the lock for a slice; launchd restarts it within 10s, which keeps crash
+    recovery and the watchdog exactly as they are the rest of the week."""
+    interval = realtime_interval(now)
+    deadline = time.time() + min(REALTIME_SLICE, realtime_seconds_left(now))
+    session = RealtimeSession()
+    polls = 0
+    try:
+        while time.time() < deadline:
+            if breaker_open(st):
+                log("breaker open; leaving realtime loop")
+                break
+            if not budget_ok(st):
+                break
+            started = time.time()
+            now = dt.datetime.now().astimezone()
+            st["lastPollAt"] = now.isoformat()   # watchdog liveness each pass
+            dropped = False
+            for venue in CFG["venues"]:
+                if probe_once(st, venue, session):
+                    dropped = True
+            target_check(st, now)
+            heartbeat(st)                        # self-throttling
+            polls += 1
+            if dropped or polls % 5 == 0:
+                save_state(st)
+            if time.time() >= deadline:
+                break
+            # jitter so a six-second cadence never looks metronomic
+            time.sleep(max(0.5, interval - (time.time() - started)
+                           + random.uniform(-0.6, 0.6)))
+    finally:
+        session.close()
+        save_state(st)
+    log(f"realtime slice: {polls} polls @ ~{interval}s "
+        f"({session.reconnects} connection(s), "
+        f"budget {st['budget']['spent']}/{CFG['daily_request_budget']})")
 
 
 def build_digest(st):
@@ -1061,7 +1246,16 @@ def main():
         if push("Sentry daily digest", build_digest(st), priority="low"):
             st["lastDigest"] = today
 
-    # daily reconcile: catches non-contiguous adds the probe can't see (W4)
+    # realtime window: hand the whole slice to the tight loop. Everything
+    # below (reconcile, restock, study) is deliberately deferred — during the
+    # hours a drop is expected, nothing competes with watching for it.
+    if realtime_interval(now):
+        realtime_loop(st, now)
+        return
+
+    # daily reconcile: catches non-contiguous adds the probe can't see (W4).
+    # A 22-date sweep takes ~90s, which is exactly the blind spot you do not
+    # want inside a drop window — hence it sits after the realtime check.
     if st["lastReconcile"] != today and now.hour >= 6:
         st["lastReconcile"] = today
         auto = set()
@@ -1131,35 +1325,7 @@ def main():
 
     # steady state: one probe per venue at horizon+1
     for venue in CFG["venues"]:
-        probe_date = (dt.date.fromisoformat(st["horizon"][venue]) +
-                      dt.timedelta(days=1)).isoformat()
-        vm = fetch_day(st, venue, probe_date)
-        if vm is BUDGET:
-            continue
-        if vm is None:
-            breaker_fail(st)
-            continue
-        breaker_success(st)
-        if odyssey_70mm(vm):
-            log(f"PROBE HIT {venue} {probe_date} — sweeping")
-            maybe_instant_alert(st, venue, probe_date)
-            dates = [(dt.date.fromisoformat(probe_date) +
-                      dt.timedelta(days=i)).isoformat()
-                     for i in range(CFG["sweep_days"])]
-            found = scan_dates(st, venue, dates)
-            hits = odyssey_70mm(vm)
-            found.setdefault(probe_date, {
-                "total": len(hits),
-                "open": sum(1 for h in hits if h["type"] == "available"),
-                "times": [h["time"] for h in hits
-                          if h["type"] == "available"]})
-            handle_drop(st, venue, found)
-        else:
-            lf = st.get("lastFetch", {})
-            log(f"quiet {venue}: nothing past {st['horizon'][venue]} "
-                f"[HTTP {lf.get('status')} {lf.get('bytes')}B "
-                f"{lf.get('movies')} movies] "
-                f"(budget {st['budget']['spent']}/{CFG['daily_request_budget']})")
+        probe_once(st, venue)
 
     # restock sniping: each watched date on its own clock — tight when the
     # show is imminent, relaxed otherwise

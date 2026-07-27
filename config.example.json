@@ -66,7 +66,7 @@
   "sweep_days": 14,
   "sweep_stop_after_empty": 3,
   "sweep_spacing_seconds": 4,
-  "daily_request_budget": 15000,
+  "daily_request_budget": 25000,
   "reconcile_days": 21,
   "quiet_start_hour": 23,
   "quiet_end_hour": 7,
@@ -81,5 +81,15 @@
   "history_enabled": true,
   "history_max_bytes": 20000000,
   "study_days": 7,
-  "study_every_seconds": 600
+  "study_every_seconds": 600,
+  "realtime_windows": [
+    {
+      "days": [
+        "Tue"
+      ],
+      "start_hour": 6,
+      "end_hour": 12,
+      "interval_seconds": 6
+    }
+  ]
 }
