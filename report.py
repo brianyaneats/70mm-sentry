@@ -218,7 +218,10 @@ input[type=range]{width:100%;accent-color:var(--ink);margin:12px 0 0}
 .cell .sw{width:8px;height:8px;border-radius:2px;background:var(--idle)}
 .cell.a .sw{background:var(--open)}
 .cell.a{color:var(--ink);border-color:color-mix(in srgb,var(--open) 40%,transparent)}
-.cell.s .sw,.cell.r .sw{background:var(--gone)}
+.cell.s .sw{background:var(--gone)}
+/* restricted is its own state, not a shade of sold out: it is the only
+   transition this feed actually shows, so it must be readable as distinct */
+.cell.r .sw{background:transparent;border:2px solid var(--gone)}
 .hours{display:flex;align-items:flex-end;gap:3px;height:88px;margin-top:6px}
 .hr{flex:1;display:flex;flex-direction:column;justify-content:flex-end;
  align-items:center;gap:4px;min-width:0}
@@ -370,8 +373,10 @@ and how long they lasted.</p>
  </div>
  <div class="legend">
   <span><span class="dot" style="background:var(--open)"></span>reopened</span>
-  <span><span class="dot" style="background:var(--gone)"></span>taken</span>
-  <span><span class="dot" style="background:var(--idle)"></span>no data yet</span>
+  <span><span class="dot" style="background:var(--gone)"></span>sold out</span>
+  <span><span class="dot" style="background:transparent;
+   box-sizing:border-box;border:2px solid var(--gone)"></span>restricted</span>
+  <span><span class="dot" style="background:var(--idle)"></span>not seen yet</span>
  </div>
  <div class="map">{"".join(groups)}</div>
 </div>
