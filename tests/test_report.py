@@ -189,3 +189,15 @@ class TestRestrictedNuance(unittest.TestCase):
         rows.append(ev(20, time_="1:00p", frm="available", to="restricted"))
         html = report.render(report.analyze(rows), sentry.CFG)
         self.assertIn("flipping 1 time on", html)
+
+
+class TestSamplingCaveat(unittest.TestCase):
+    def test_footer_states_the_resolution_limit(self):
+        html = report.render(report.analyze([ev(60), ev(30)]), sentry.CFG)
+        self.assertIn("Sampled every", html)
+        self.assertIn("bounded by that interval", html)
+
+    def test_caveat_tracks_the_configured_interval(self):
+        cfg = dict(sentry.CFG, study_every_seconds=300)
+        html = report.render(report.analyze([ev(60), ev(30)]), cfg)
+        self.assertIn("Sampled every 5 min", html)

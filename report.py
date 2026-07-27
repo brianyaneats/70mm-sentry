@@ -401,6 +401,7 @@ def render(a, cfg):
     else:
         finding = ""
 
+    every_min = cfg.get("study_every_seconds", 600) // 60
     best = max(range(24), key=lambda h: a["byHour"][h])
     hour_note = (f'Most reopenings seen around <strong>{best}:00 '
                  f'{esc(a["tz"].split("/")[-1].replace("_", " "))}</strong>.'
@@ -409,7 +410,7 @@ def render(a, cfg):
     body = f"""{head}<div class="wrap">
 <p class="eyebrow">Availability study · {esc(venue)}</p>
 <h1>What sold out really means.</h1>
-<p class="lede">Every {esc(str(sentry.CFG.get("study_every_seconds", 600) // 60))}
+<p class="lede">Every {every_min}
 minutes the watcher re-reads every showtime it can see and records only what
 changed. This is {esc(a["hours"])} hours of that record — and the most useful
 thing in it is what never moves.</p>
@@ -450,6 +451,10 @@ thing in it is what never moves.</p>
 a showtime counted as open is purchasable, which is not the same as a seat you
 would want. Independent tool, not affiliated with AMC Theatres, IMAX, or
 Fandango.</footer></div>"""
+    body = body.replace("</footer>", (
+        f' Sampled every {every_min} min, so any duration here is bounded by '
+        f'that interval rather than measured — a state seen in a single '
+        f'sample may have lasted moments.</footer>'))
     return PAGE.format(css=ascii_safe(CSS), js=JS, data=json.dumps(
         {"grid": a["grid"], "labels": a["labels"], "slots": a["slots"]}),
         body=ascii_safe(body))
