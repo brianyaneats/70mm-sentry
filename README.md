@@ -60,6 +60,17 @@ secrets to arm the off-box dead-man (see Observability).
   `restock_burst_seconds` (60) when the date is today/tomorrow, since most
   cancellations land in the final hours before a screening, else every
   `restock_every_seconds` (300). A soldout→available flip rings the phone.
+- **Realtime windows:** `realtime_windows` (Tue 06:00–12:00 ET at 6 s) is the
+  drop-hour tier — reported to be when the following weeks' dates go on sale.
+  Inside one the watcher stops behaving like a cron job: `realtime_loop()`
+  holds a 55-second slice of tight polling over a single kept-alive TLS
+  connection (21 ms/poll warm vs 54 ms cold), then exits so launchd restarts
+  it — crash recovery, the flock and the watchdog stay exactly as they are the
+  rest of the week. The daily reconcile is deferred out of these windows,
+  since its ~90 s sweep is the worst blind spot to have during a drop.
+  Fandango offers no push transport (no websocket, no SSE, and it ignores
+  `If-None-Match`), so polling is the only option — this is polling made as
+  stream-like as the source allows.
 - **Cadence tiers:** the timer (launchd or the container loop) fires every
   10 s; the script itself decides whether it's due. `burst_windows` (e.g.
   `[{"days": ["Tue"], "start_hour": 9, "end_hour": 12}]`) poll at

@@ -63,6 +63,20 @@ an Xcode install once broke `/usr/bin/python3` and killed polling silently.
   state. Don't remove it.
 - Cadence windows evaluate in `schedule_tz` (America/New_York — theater
   time), not host time. The Mac's clock is Pacific; a 3h skew bug existed.
+- **No push transport exists.** Verified 2026-07-27 by instrumenting
+  WebSocket/EventSource/fetch on Fandango's theater page: no WS, no SSE, no
+  SockJS/Socket.IO/Pusher/Ably, and no background polling. The endpoint
+  returns an ETag but **ignores `If-None-Match`** (conditional GET still
+  answers 200 with the full 15.5KB). Polling is the only option — don't
+  re-investigate websockets.
+- **Realtime windows** (`realtime_windows`, currently Tue 06:00–12:00 ET at
+  6s) hand the cycle to `realtime_loop()`: 55-second slices of tight polling
+  over one kept-alive TLS connection (21ms/poll warm vs 54ms cold, measured).
+  Slices keep launchd supervision, the flock and the watchdog unchanged.
+  `lastPollAt` updates every pass; state persists immediately on a drop;
+  sleep is floored at 0.5s so no config typo can hammer the endpoint. The
+  daily reconcile is deliberately deferred out of these windows — its ~90s
+  sweep is the worst possible blind spot during a drop hour.
 
 ## Alarms and what they mean
 
