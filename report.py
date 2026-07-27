@@ -167,7 +167,9 @@ header .wrap{padding:18px 24px;display:flex;align-items:center;
 .eyebrow{font-size:12px;font-weight:500;letter-spacing:.08em;
  text-transform:uppercase;color:var(--ink44);margin:0 0 10px}
 h1{font-size:30px;line-height:36px;font-weight:600;letter-spacing:-.75px;
- margin:0 0 14px}
+ margin:0 0 14px;text-wrap:balance}
+:focus-visible{outline:2px solid var(--ink);outline-offset:2px;
+ border-radius:3px}
 h2{font-size:16px;font-weight:600;margin:0 0 6px}
 .lede{font-size:15px;color:var(--ink64);max-width:560px;margin:0 0 8px}
 .stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));
@@ -185,7 +187,11 @@ h2{font-size:16px;font-weight:600;margin:0 0 6px}
 .card-head .sub{font-size:13px;color:var(--ink44)}
 .panel{background:var(--inset);border-radius:var(--r);padding:16px}
 .scrub{display:flex;align-items:center;gap:12px;margin-bottom:10px}
-.scrub .now{font-size:13px;font-weight:500;font-variant-numeric:tabular-nums}
+/* the utility face carries every reading of the instrument — timestamps,
+   axis ticks, counts — so measured values never read as prose */
+.scrub .now{font-family:var(--mono);font-size:13px;font-weight:500;
+ font-variant-numeric:tabular-nums}
+.ends,.hr span,.cell{font-family:var(--mono)}
 .bars{display:flex;align-items:center;gap:1px;height:64px;width:100%}
 .bar{flex:1;display:flex;flex-direction:column;justify-content:center;
  gap:1px;min-width:0;cursor:pointer}
