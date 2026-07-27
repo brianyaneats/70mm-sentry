@@ -1630,3 +1630,36 @@ class TestStudyDates(SentryTest):
             self.now - dt.timedelta(minutes=11)).isoformat()
         self.assertEqual(sentry.study_due_dates(self.st, self.now),
                          ["2026-07-26"])
+
+
+class TestExpiredDateResponse(SentryTest):
+    """Fandango answers {"date": null} — no viewModel — for a date whose
+    showtimes have all passed. Valid, not a failure."""
+    BODY = json.dumps({"date": None}).encode()
+
+    def test_returns_empty_viewmodel_not_failure(self):
+        with mock.patch.object(sentry.urllib.request, "urlopen",
+                               return_value=FakeResp(self.BODY)):
+            vm = sentry.fetch_day(self.st, "AABQI", "2026-07-26")
+        self.assertEqual(vm, {})
+        self.assertIsNotNone(vm)          # None would trip the breaker
+        self.assertEqual(sentry.odyssey_70mm(vm), [])
+        self.assertTrue(self.st["lastFetch"]["ok"])
+
+    def test_does_not_inflate_blind_streak(self):
+        self.st["blindStreak"] = 7
+        with mock.patch.object(sentry.urllib.request, "urlopen",
+                               return_value=FakeResp(self.BODY)):
+            sentry.fetch_day(self.st, "AABQI", "2026-07-26")
+        self.assertEqual(self.st["blindStreak"], 7)  # unchanged, either way
+
+    def test_scan_dates_treats_it_as_an_empty_day(self):
+        with mock.patch.object(sentry, "fetch_day", return_value={}):
+            found = sentry.scan_dates(self.st, "AABQI", ["d1", "d2", "d3"])
+        self.assertEqual(found, {})
+        self.assertEqual(self.st["breaker"]["failures"], 0)
+
+    def test_malformed_json_is_still_a_real_failure(self):
+        with mock.patch.object(sentry.urllib.request, "urlopen",
+                               return_value=FakeResp(b"<html>nope</html>")):
+            self.assertIsNone(sentry.fetch_day(self.st, "AABQI", "2026-07-26"))

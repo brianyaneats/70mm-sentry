@@ -299,7 +299,19 @@ def fetch_day(st, venue, date):
         with urllib.request.urlopen(req, timeout=25) as r:
             body = r.read()
             status = getattr(r, "status", None)
-        vm = json.loads(body)["viewModel"]
+        payload = json.loads(body)
+        vm = payload["viewModel"]
+    except KeyError:
+        # a day whose showtimes have all passed answers {"date": null} with no
+        # viewModel at all. That is a valid "nothing listed", not a failure:
+        # counting it would trip the breaker every night once the study poll
+        # reaches today's expired date, and inflating blindStreak would fire a
+        # false SENTRY BLIND. Record it and stay neutral on both counters.
+        st["lastFetch"] = {"at": dt.datetime.now().isoformat(), "ok": True,
+                           "venue": venue, "date": date, "status": status,
+                           "bytes": len(body), "movies": 0, "hits": 0,
+                           "note": "no listings for this date"}
+        return {}
     except Exception as e:
         st["lastFetch"] = {"at": dt.datetime.now().isoformat(), "ok": False,
                            "venue": venue, "date": date, "error": str(e)[:200]}
