@@ -96,15 +96,25 @@ class SentryTest(unittest.TestCase):
     def setUp(self):
         self._cfg = sentry.CFG
         self._log = sentry.LOG_PATH
+        self._hist = sentry.HISTORY_PATH
         sentry.CFG = copy.deepcopy(TEST_CFG)
         fd, sentry.LOG_PATH = tempfile.mkstemp(suffix=".log")
+        os.close(fd)
+        # fetch_day records history as a side effect, and the fixtures use a
+        # real-looking venue/date — without this redirect the suite appends
+        # fabricated rows to the PRODUCTION history.jsonl (it did: 16 of them)
+        fd, sentry.HISTORY_PATH = tempfile.mkstemp(suffix=".jsonl")
         os.close(fd)
         self.st = sentry.default_state()
 
     def tearDown(self):
         os.unlink(sentry.LOG_PATH)
+        for p in (sentry.HISTORY_PATH, sentry.HISTORY_PATH + ".1"):
+            if os.path.exists(p):
+                os.unlink(p)
         sentry.CFG = self._cfg
         sentry.LOG_PATH = self._log
+        sentry.HISTORY_PATH = self._hist
 
 
 class TestDetection(SentryTest):
@@ -1525,19 +1535,9 @@ class TestTelegramSetupGuard(SentryTest):
 
 class TestHistoryRecorder(SentryTest):
     def setUp(self):
-        super().setUp()
-        fd, self.hist = tempfile.mkstemp(suffix=".jsonl")
-        os.close(fd)
-        os.unlink(self.hist)  # start absent, like a fresh install
-        self.p = mock.patch.object(sentry, "HISTORY_PATH", self.hist)
-        self.p.start()
-
-    def tearDown(self):
-        self.p.stop()
-        for f in (self.hist, self.hist + ".1"):
-            if os.path.exists(f):
-                os.unlink(f)
-        super().tearDown()
+        super().setUp()          # already redirects HISTORY_PATH to a temp file
+        self.hist = sentry.HISTORY_PATH
+        os.unlink(self.hist)     # start absent, like a fresh install
 
     def rows(self):
         if not os.path.exists(self.hist):
@@ -1663,3 +1663,28 @@ class TestExpiredDateResponse(SentryTest):
         with mock.patch.object(sentry.urllib.request, "urlopen",
                                return_value=FakeResp(b"<html>nope</html>")):
             self.assertIsNone(sentry.fetch_day(self.st, "AABQI", "2026-07-26"))
+
+
+class TestSuiteDoesNotTouchProductionData(SentryTest):
+    """Regression guard: the suite once appended fabricated rows to the real
+    history.jsonl because fetch_day records as a side effect. Every writable
+    path the tests can reach must point somewhere disposable."""
+
+    def test_history_and_log_paths_are_redirected(self):
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for path in (sentry.HISTORY_PATH, sentry.LOG_PATH):
+            self.assertFalse(
+                os.path.abspath(path).startswith(repo + os.sep),
+                f"{path} points inside the repo — tests would clobber real data")
+
+    def test_a_recording_fetch_writes_only_to_the_temp_file(self):
+        real = os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "history.jsonl")
+        before = os.path.getsize(real) if os.path.exists(real) else None
+        body = json.dumps({"viewModel": viewmodel([showtime()])}).encode()
+        with mock.patch.object(sentry.urllib.request, "urlopen",
+                               return_value=FakeResp(body)):
+            sentry.fetch_day(self.st, "AABQI", "2026-08-20")
+        after = os.path.getsize(real) if os.path.exists(real) else None
+        self.assertEqual(before, after)
+        self.assertTrue(os.path.getsize(sentry.HISTORY_PATH) > 0)
