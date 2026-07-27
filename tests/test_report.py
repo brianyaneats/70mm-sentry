@@ -159,3 +159,33 @@ class TestStatHonesty(unittest.TestCase):
         html = report.render(report.analyze([ev(60), ev(30)]), sentry.CFG)
         self.assertIn("flips to on sale", html)
         self.assertNotIn("refunds seen", html)
+
+
+class TestRestrictedNuance(unittest.TestCase):
+    """'Refunds are invisible' is only claimable while nothing moves. Once a
+    restricted flip is observed the page must soften to what was measured."""
+
+    def _base(self):
+        # available, not the helper's soldout default — a sellout would
+        # (correctly) suppress the block outright
+        return [ev(300 - i * 10, time_=f"{i}:00p", to="available")
+                for i in range(1, 7)]
+
+    def test_blunt_claim_only_when_nothing_moves(self):
+        html = report.render(report.analyze(self._base()), sentry.CFG)
+        self.assertIn("refunds cannot be", html)
+        self.assertNotIn("unverified", html)
+
+    def test_restricted_flip_softens_the_claim(self):
+        rows = self._base()
+        rows.append(ev(20, time_="1:00p", frm="available", to="restricted"))
+        html = report.render(report.analyze(rows), sentry.CFG)
+        self.assertNotIn("refunds cannot be", html)
+        self.assertIn("unverified", html)
+        self.assertIn("restricted", html)
+
+    def test_plural_agreement_on_single_flip(self):
+        rows = self._base()
+        rows.append(ev(20, time_="1:00p", frm="available", to="restricted"))
+        html = report.render(report.analyze(rows), sentry.CFG)
+        self.assertIn("flipping 1 time on", html)

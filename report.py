@@ -131,6 +131,8 @@ def analyze(rows):
             "statuses": dict(collections.Counter(
                 e["to"] for e in events)),
             "everSoldout": any(e["to"] == "soldout" for e in events),
+            "restrictedFlips": sum(1 for e in events if e["from"] is not None
+                                   and "restricted" in (e["from"], e["to"])),
             "medianSurvivalMin": (round(statistics.median(survival) / 60, 1)
                                   if survival else None),
             "fastestSurvivalMin": (round(min(survival) / 60, 1)
@@ -362,20 +364,40 @@ def render(a, cfg):
     if not t["everSoldout"] and t["slots"] >= 5:
         seen = ", ".join(f"{esc(k)} ({v})" for k, v in
                          sorted(t["statuses"].items(), key=lambda x: -x[1]))
-        finding = (
+        head = (
             f'<div class="card fade"><div class="card-head">'
             f'<h2>What this feed can and cannot see</h2></div>'
             f'<p class="lede" style="max-width:640px">Across {t["slots"]} '
             f'showtimes over {a["hours"]} hours, not one has ever reported '
-            f'<em>sold out</em>. Observed states: {seen}. Public listings mark '
-            f'a showtime on sale, not whether a seat is left — so a house with '
-            f'zero seats and a house with fifty look identical here.</p>'
-            f'<p class="lede" style="max-width:640px;margin-top:12px">'
-            f'Consequence worth being blunt about: refunds cannot be detected '
-            f'from this data. Watching for <strong>new dates going on '
-            f'sale</strong> — where a whole auditorium opens at once — is the '
-            f'mechanism that actually works. Per-seat detection needs '
-            f'seat-level access this feed does not carry.</p></div>')
+            f'<em>sold out</em>. Observed states: {seen}. A listing marks a '
+            f'showtime on sale, not whether a seat is left — so a house with '
+            f'zero seats and a house with fifty can look identical here.</p>')
+        if t["restrictedFlips"]:
+            # restricted moves per showtime, so the blunt "refunds are
+            # invisible" claim would overstate what has been measured
+            tail = (
+                f'<p class="lede" style="max-width:640px;margin-top:12px">'
+                f'One state does move: <strong>restricted</strong>, seen '
+                f'flipping {t["restrictedFlips"]} time'
+                f'{"s" if t["restrictedFlips"] != 1 else ""} on individual '
+                f'showtimes while neighbouring ones stayed on sale. Whether '
+                f'that tracks real scarcity is <em>unverified</em> — it cannot '
+                f'be confirmed without seat-level access. If it does, it is '
+                f'the only refund signal this source offers; if it does not, '
+                f'refunds are invisible here.</p>'
+                f'<p class="lede" style="max-width:640px;margin-top:12px">'
+                f'Either way, watching for <strong>new dates going on '
+                f'sale</strong> — a whole auditorium at once — is the '
+                f'mechanism that is known to work.</p></div>')
+        else:
+            tail = (
+                f'<p class="lede" style="max-width:640px;margin-top:12px">'
+                f'Consequence worth being blunt about: refunds cannot be '
+                f'detected from this data. Watching for <strong>new dates '
+                f'going on sale</strong> — where a whole auditorium opens at '
+                f'once — is the mechanism that actually works. Per-seat '
+                f'detection needs access this feed does not carry.</p></div>')
+        finding = head + tail
     else:
         finding = ""
 
