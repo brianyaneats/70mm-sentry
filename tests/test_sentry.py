@@ -1912,3 +1912,65 @@ class TestRequestPacing(SentryTest):
         with mock.patch.object(sentry.time, "sleep", slept.append):
             sentry.pace_request()
         self.assertEqual(slept, [])
+
+
+class TestRealtimeSeam(SentryTest):
+    """Every slice ends with a process restart. Inside a window that seam is
+    dead air, so nothing avoidable should widen it."""
+
+    def setUp(self):
+        super().setUp()
+        sentry.CFG["realtime_windows"] = RT_WINDOW
+        sentry.CFG["schedule_tz"] = "America/New_York"
+
+    def test_no_start_jitter_inside_a_window(self):
+        with mock.patch.object(sentry, "acquire_lock", return_value=True), \
+                mock.patch.object(sentry, "rotate_log"), \
+                mock.patch.object(sentry, "load_state",
+                                  return_value=self.st), \
+                mock.patch.object(sentry, "save_state"), \
+                mock.patch.object(sentry, "realtime_interval",
+                                  return_value=6), \
+                mock.patch.object(sentry, "realtime_loop"), \
+                mock.patch.object(sentry, "breaker_open", return_value=False), \
+                mock.patch.object(sentry.time, "sleep") as slept:
+            self.st["lastPollAt"] = None
+            sentry.main()
+        slept.assert_not_called()
+
+    def test_jitter_still_applies_outside_a_window(self):
+        with mock.patch.object(sentry, "acquire_lock", return_value=True), \
+                mock.patch.object(sentry, "rotate_log"), \
+                mock.patch.object(sentry, "load_state",
+                                  return_value=self.st), \
+                mock.patch.object(sentry, "save_state"), \
+                mock.patch.object(sentry, "realtime_interval",
+                                  return_value=None), \
+                mock.patch.object(sentry, "breaker_open", return_value=True), \
+                mock.patch.object(sentry.time, "sleep") as slept:
+            self.st["lastPollAt"] = None
+            sentry.main()
+        slept.assert_called_once()
+        self.assertLessEqual(slept.call_args.args[0], 5)
+
+    def test_slice_is_long_enough_to_amortise_the_seam(self):
+        # ~12s seam: at 55s that is ~18% of the window, at 240s ~5%
+        self.assertGreaterEqual(sentry.REALTIME_SLICE, 120)
+        seam = 12.0
+        self.assertLess(seam / (sentry.REALTIME_SLICE + seam), 0.08)
+
+    def test_slice_never_outruns_the_window_close(self):
+        with mock.patch.object(sentry, "realtime_seconds_left",
+                               return_value=30), \
+                mock.patch.object(sentry, "realtime_interval",
+                                  return_value=0.05), \
+                mock.patch.object(sentry, "target_check"), \
+                mock.patch.object(sentry, "heartbeat"), \
+                mock.patch.object(sentry, "save_state"), \
+                mock.patch.object(sentry, "RealtimeSession"), \
+                mock.patch.object(sentry, "probe_once", return_value=False), \
+                mock.patch.object(sentry.time, "sleep"):
+            start = sentry.time.time()
+            sentry.realtime_loop(self.st, dt.datetime.now().astimezone())
+            # deadline honours seconds-left, not the full slice
+            self.assertLess(sentry.time.time() - start, 35)

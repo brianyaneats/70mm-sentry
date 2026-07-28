@@ -1048,7 +1048,13 @@ def restock_check(st, venue, dates):
             st["restockAlerted"].extend(k for *_, k in freed)
 
 
-REALTIME_SLICE = 55   # seconds of tight looping per invocation
+# Seconds of tight looping per invocation. Every slice ends with a seam —
+# the process exits, launchd respawns it, config and state reload — measured
+# at ~12s on 2026-07-28. Short slices pay that seam often (55s slices lost
+# ~18% of the window to it); longer ones amortise it (~5% at 240s) while
+# still bounding how long one process holds the lock and how quickly a hung
+# slice is replaced.
+REALTIME_SLICE = 240
 
 
 def probe_once(st, venue, session=None):
@@ -1229,8 +1235,11 @@ def main():
     now = dt.datetime.now().astimezone()  # aware: DST-safe interval math
     fast = os.environ.get("SENTRY_NOW") == "1"
 
-    if not fast:
-        time.sleep(random.uniform(0, 5))  # jitter so runs never look metronomic
+    # jitter so runs never look metronomic — but not inside a realtime
+    # window, where it only widens the seam between slices. The loop jitters
+    # every poll internally, so the anti-pattern cover is already there.
+    if not fast and not realtime_interval(now):
+        time.sleep(random.uniform(0, 5))
 
     # cadence gate: launchd fires every 10s; run only when the current
     # tier's interval (burst / base / overnight) has elapsed. The 0.9
