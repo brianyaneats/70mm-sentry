@@ -25,6 +25,11 @@ import sentry
 OPEN = "available"
 GONE = ("soldout", "restricted")
 BUCKETS = 120
+# A transition is only "when it happened" if we had eyes on it recently.
+# Dates inside the study window are re-read every few minutes; dates only the
+# daily reconcile reaches carry ~24h of uncertainty, and charting those by
+# hour would plot the reconcile's schedule, not the box office's.
+PRECISE_WITHIN = 900
 
 
 def load_events(path=None):
@@ -86,6 +91,7 @@ def analyze(rows):
     taken = [0] * BUCKETS
     by_hour = [0] * 24
     survival = []          # seconds a reopened slot stayed available
+    precise_opened = coarse_opened = 0
     open_since = {}
     first_seen_at = {}
 
@@ -101,9 +107,15 @@ def analyze(rows):
             if e["to"] == OPEN:
                 open_since[i] = e["t"]
             continue  # a first sighting is a baseline, not churn
+        precise = (e.get("within") is not None
+                   and e["within"] <= PRECISE_WITHIN)
         if e["to"] == OPEN and e["from"] in GONE:
             opened[b] += 1
-            by_hour[e["t"].hour] += 1
+            if precise:                    # only well-pinned events may vote
+                by_hour[e["t"].hour] += 1
+                precise_opened += 1
+            else:
+                coarse_opened += 1
             open_since[i] = e["t"]
         elif e["to"] in GONE and e["from"] == OPEN:
             taken[b] += 1
@@ -138,6 +150,8 @@ def analyze(rows):
             "fastestSurvivalMin": (round(min(survival) / 60, 1)
                                    if survival else None),
             "survivalSamples": len(survival),
+            "preciseOpened": precise_opened,
+            "coarseOpened": coarse_opened,
         },
     }
 
@@ -403,9 +417,23 @@ def render(a, cfg):
 
     every_min = cfg.get("study_every_seconds", 600) // 60
     best = max(range(24), key=lambda h: a["byHour"][h])
-    hour_note = (f'Most reopenings seen around <strong>{best}:00 '
-                 f'{esc(a["tz"].split("/")[-1].replace("_", " "))}</strong>.'
-                 if sum(a["byHour"]) else 'No reopenings recorded yet.')
+    if not sum(a["byHour"]):
+        hour_note = ('No precisely-timed reopening yet. Only showtimes re-read '
+                     'every few minutes can be placed on a clock; the rest are '
+                     'seen once a day and could have changed at any point in '
+                     'between.')
+    else:
+        hour_note = (f'Most reopenings seen around <strong>{best}:00 '
+                     f'{esc(a["tz"].split("/")[-1].replace("_", " "))}</strong>'
+                     f' — from {t["preciseOpened"]} reopening'
+                     f'{"s" if t["preciseOpened"] != 1 else ""} pinned to '
+                     f'within {PRECISE_WITHIN // 60} minutes.')
+    if t["coarseOpened"]:
+        hour_note += (f' {t["coarseOpened"]} further reopening'
+                      f'{"s are" if t["coarseOpened"] != 1 else " is"} '
+                      f'excluded here: those showtimes are only re-read once a '
+                      f'day, so their timestamps record when the watcher '
+                      f'looked, not when the seat came back.')
 
     body = f"""{head}<div class="wrap">
 <p class="eyebrow">Availability study · {esc(venue)}</p>

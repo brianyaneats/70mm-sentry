@@ -152,6 +152,7 @@ def default_state():
         "announced": [],
         "restockAlerted": [],
         "histSeen": {},
+        "histSeenAt": {},
         "studyLastPoll": {},
     }
 
@@ -449,22 +450,40 @@ def record_history(st, venue, date, hits):
 
     Uses its own last-seen map (histSeen), deliberately not seenAvailability:
     that one is alerting bookkeeping written at different points in the cycle,
-    and sharing it would couple recording order to alerting order."""
+    and sharing it would couple recording order to alerting order.
+
+    Each transition carries `within`: seconds since this showtime was last
+    observed, i.e. how tightly the change is actually pinned down. `at` is
+    when we *looked*, never when it happened. Dates inside the study window
+    are re-read every few minutes so `within` is small; dates only the daily
+    reconcile reaches carry ~24h, and treating those as measurements
+    manufactures patterns that are really just the reconcile's own clock."""
     if not CFG.get("history_enabled", True) or not hits:
         return
     seen = st.setdefault("histSeen", {})
-    now_iso = dt.datetime.now().isoformat(timespec="seconds")
+    seen_at = st.setdefault("histSeenAt", {})
+    now = dt.datetime.now()
+    now_iso = now.isoformat(timespec="seconds")
     rows = []
     for h in hits:
         if not slot_qualifies(h["time"]):
             continue
         key = f"{venue}|{date}|{h['time']}"
         prev = seen.get(key)
+        last_at = seen_at.get(key)
+        seen_at[key] = now_iso
         if prev == h["type"]:
             continue
         seen[key] = h["type"]
+        within = None
+        if last_at:
+            try:
+                within = int(elapsed_seconds(now, last_at))
+            except Exception:
+                within = None
         rows.append({"at": now_iso, "venue": venue, "date": date,
-                     "time": h["time"], "from": prev, "to": h["type"]})
+                     "time": h["time"], "from": prev, "to": h["type"],
+                     "within": within})
     if not rows:
         return
     try:
@@ -1343,6 +1362,8 @@ def main():
             if d >= today}
         st["histSeen"] = {k: v for k, v in st.get("histSeen", {}).items()
                           if k.split("|")[1] >= today}
+        st["histSeenAt"] = {k: v for k, v in st.get("histSeenAt", {}).items()
+                            if k.split("|")[1] >= today}
         heartbeat(st)
         save_state(st)
         snapshot_state(st)

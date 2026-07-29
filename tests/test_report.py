@@ -201,3 +201,42 @@ class TestSamplingCaveat(unittest.TestCase):
         cfg = dict(sentry.CFG, study_every_seconds=300)
         html = report.render(report.analyze([ev(60), ev(30)]), cfg)
         self.assertIn("Sampled every 5 min", html)
+
+
+def evw(mins_ago, within, frm="soldout", to="available", time_="6:00p"):
+    r = ev(mins_ago, time_=time_, frm=frm, to=to)
+    r["within"] = within
+    return r
+
+
+class TestPrecisionAwareStats(unittest.TestCase):
+    """Only well-pinned events may vote on 'when refunds land'."""
+
+    def test_coarse_events_excluded_from_the_hour_chart(self):
+        a = report.analyze([ev(300, to="soldout"),
+                            evw(100, within=86400)])   # daily reconcile
+        self.assertEqual(sum(a["byHour"]), 0)
+        self.assertEqual(a["totals"]["coarseOpened"], 1)
+        self.assertEqual(a["totals"]["preciseOpened"], 0)
+
+    def test_precise_events_do_vote(self):
+        a = report.analyze([ev(300, to="soldout"), evw(100, within=180)])
+        self.assertEqual(sum(a["byHour"]), 1)
+        self.assertEqual(a["totals"]["preciseOpened"], 1)
+
+    def test_legacy_rows_without_within_are_treated_as_coarse(self):
+        a = report.analyze([ev(300, to="soldout"),
+                            ev(100, frm="soldout", to="available")])
+        self.assertEqual(sum(a["byHour"]), 0)
+        self.assertEqual(a["totals"]["coarseOpened"], 1)
+
+    def test_page_explains_why_events_were_excluded(self):
+        html = report.render(report.analyze(
+            [ev(300, to="soldout"), evw(100, within=86400)]), sentry.CFG)
+        self.assertIn("when the watcher looked", html)
+        self.assertIn("once a day", html)
+
+    def test_page_reports_the_precise_sample_size(self):
+        html = report.render(report.analyze(
+            [ev(300, to="soldout"), evw(100, within=120)]), sentry.CFG)
+        self.assertIn("pinned to within", html)

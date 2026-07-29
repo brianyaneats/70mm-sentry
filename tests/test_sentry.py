@@ -1974,3 +1974,60 @@ class TestRealtimeSeam(SentryTest):
             sentry.realtime_loop(self.st, dt.datetime.now().astimezone())
             # deadline honours seconds-left, not the full slice
             self.assertLess(sentry.time.time() - start, 35)
+
+
+class TestObservationPrecision(SentryTest):
+    """`at` is when we looked, not when it happened. Every transition must
+    carry how tightly it is actually pinned, or a daily reconcile's batch
+    timestamps get read as if they were measurements."""
+
+    def setUp(self):
+        super().setUp()
+        fd, self.hist = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        os.unlink(self.hist)
+        self._p = mock.patch.object(sentry, "HISTORY_PATH", self.hist)
+        self._p.start()
+
+    def tearDown(self):
+        self._p.stop()
+        for f in (self.hist, self.hist + ".1"):
+            if os.path.exists(f):
+                os.unlink(f)
+        super().tearDown()
+
+    def rows(self):
+        return [json.loads(l) for l in open(self.hist) if l.strip()]
+
+    def test_first_sighting_has_no_uncertainty_bound(self):
+        sentry.record_history(self.st, "AABQI", "2026-08-15",
+                              [{"time": "6:00p", "type": "soldout"}])
+        self.assertIsNone(self.rows()[0]["within"])
+
+    def test_transition_carries_seconds_since_last_look(self):
+        sentry.record_history(self.st, "AABQI", "2026-08-15",
+                              [{"time": "6:00p", "type": "soldout"}])
+        # pretend the previous observation was an hour ago
+        self.st["histSeenAt"]["AABQI|2026-08-15|6:00p"] = (
+            dt.datetime.now() - dt.timedelta(hours=1)).isoformat(
+                timespec="seconds")
+        sentry.record_history(self.st, "AABQI", "2026-08-15",
+                              [{"time": "6:00p", "type": "available"}])
+        self.assertAlmostEqual(self.rows()[-1]["within"], 3600, delta=30)
+
+    def test_tight_sampling_yields_a_tight_bound(self):
+        sentry.record_history(self.st, "AABQI", "2026-08-15",
+                              [{"time": "6:00p", "type": "soldout"}])
+        sentry.record_history(self.st, "AABQI", "2026-08-15",
+                              [{"time": "6:00p", "type": "available"}])
+        self.assertLess(self.rows()[-1]["within"], 10)
+
+    def test_last_look_is_recorded_even_when_nothing_changed(self):
+        sentry.record_history(self.st, "AABQI", "2026-08-15",
+                              [{"time": "6:00p", "type": "soldout"}])
+        before = self.st["histSeenAt"]["AABQI|2026-08-15|6:00p"]
+        sentry.record_history(self.st, "AABQI", "2026-08-15",
+                              [{"time": "6:00p", "type": "soldout"}])
+        self.assertGreaterEqual(
+            self.st["histSeenAt"]["AABQI|2026-08-15|6:00p"], before)
+        self.assertEqual(len(self.rows()), 1)   # still no spurious row
