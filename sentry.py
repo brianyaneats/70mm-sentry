@@ -154,6 +154,7 @@ def default_state():
         "histSeen": {},
         "histSeenAt": {},
         "studyLastPoll": {},
+        "gapCursor": 0,
     }
 
 
@@ -236,7 +237,14 @@ def breaker_fail(st):
     b = st["breaker"]
     b["failures"] += 1
     if b["failures"] >= 3 or b["state"] == "half-open":
-        backoff = min(1800 * (2 ** max(0, b["failures"] - 3)), 4 * 3600)
+        # First trip is short and escalates fast. Three read timeouts are far
+        # more often a network blip than a block — observed 2026-07-29, when a
+        # transient timeout opened the breaker for the full 30 minutes and the
+        # watchdog correctly reported us blind. A real block still escalates
+        # to hours within a few more failures, but a hiccup no longer costs
+        # half an hour of blindness minutes before a drop.
+        base = CFG.get("breaker_base_backoff_seconds", 60)
+        backoff = min(base * (2 ** max(0, b["failures"] - 3)), 4 * 3600)
         b["state"] = "open"
         b["openUntil"] = time.time() + backoff
         log(f"breaker OPEN for {backoff}s (failures={b['failures']})")
@@ -1076,12 +1084,36 @@ def restock_check(st, venue, dates):
 REALTIME_SLICE = 240
 
 
-def probe_once(st, venue, session=None):
-    """Probe the first date past the horizon. Returns True if a drop was
-    found and handled. Shared by the steady cycle and the realtime loop so
-    both take exactly the same path on the one event that matters."""
-    probe_date = (dt.date.fromisoformat(st["horizon"][venue]) +
-                  dt.timedelta(days=1)).isoformat()
+def gap_probe_date(st, venue, now):
+    """Next near-future date we have NOT announced yet, walked one per cycle.
+
+    The horizon probe only ever looks at horizon+1, which assumes AMC extends
+    the run contiguously. It does not: on 2026-07-29 Aug 25 and Aug 26 went on
+    sale while Aug 20-24 stayed empty, so the probe saw nothing and only the
+    explicit target watch caught Aug 26 — Aug 25 was invisible entirely. This
+    walk is deliberately independent of the horizon, so a jump forward can
+    never strand the dates behind it."""
+    days = CFG.get("gap_scan_days", 40)
+    if not days:
+        return None
+    cursor = st.get("gapCursor", 0) % days
+    for i in range(days):
+        idx = (cursor + i) % days
+        d = (now.date() + dt.timedelta(days=idx + 1)).isoformat()
+        if announce_ok(st, d) and d not in st["alerted"].get(venue, []):
+            st["gapCursor"] = (idx + 1) % days
+            return d
+    st["gapCursor"] = (cursor + 1) % days
+    return None
+
+
+def probe_once(st, venue, session=None, date=None):
+    """Probe a date past the horizon (default horizon+1). Returns True if a
+    drop was found and handled. Shared by the steady cycle, the realtime loop
+    and the gap walk so all three take exactly the same path on the one event
+    that matters."""
+    probe_date = date or (dt.date.fromisoformat(st["horizon"][venue]) +
+                          dt.timedelta(days=1)).isoformat()
     vm = fetch_day(st, venue, probe_date, session=session)
     if vm is BUDGET:
         return False
@@ -1139,6 +1171,13 @@ def realtime_loop(st, now):
             for venue in CFG["venues"]:
                 if probe_once(st, venue, session):
                     dropped = True
+                # one gap step every 10th pass: enough to sweep a 40-day
+                # window inside a window's slice budget without halving the
+                # horizon probe's cadence
+                if polls % 10 == 0:
+                    gd = gap_probe_date(st, venue, now)
+                    if gd and probe_once(st, venue, session, date=gd):
+                        dropped = True
             target_check(st, now)
             heartbeat(st)                        # self-throttling
             polls += 1
@@ -1379,9 +1418,14 @@ def main():
     # reconcile.
     target_check(st, now)
 
-    # steady state: one probe per venue at horizon+1
+    # steady state: probe horizon+1, plus one step of the gap walk so a
+    # non-contiguous add is found in minutes instead of waiting for the
+    # daily reconcile
     for venue in CFG["venues"]:
         probe_once(st, venue)
+        gd = gap_probe_date(st, venue, now)
+        if gd:
+            probe_once(st, venue, date=gd)
 
     # restock sniping: each watched date on its own clock — tight when the
     # show is imminent, relaxed otherwise

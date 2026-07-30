@@ -92,5 +92,7 @@
       "interval_seconds": 6
     }
   ],
-  "min_request_spacing_seconds": 1.0
+  "min_request_spacing_seconds": 1.0,
+  "gap_scan_days": 40,
+  "breaker_base_backoff_seconds": 60
 }
