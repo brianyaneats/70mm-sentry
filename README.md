@@ -59,15 +59,25 @@ secrets to arm the off-box dead-man (see Observability).
   in `config → restock_watch_dates`) are re-polled on their own clock — every
   `restock_burst_seconds` (60) when the date is today/tomorrow, since most
   cancellations land in the final hours before a screening, else every
-  `restock_every_seconds` (300). A soldout→available flip rings the phone.
+  `restock_every_seconds` (300). Two events ring the phone: a
+  soldout→available flip, and a brand-new buyable slot appearing on a
+  watched date the sentry has observed before — AMC's placeholder listings
+  can resolve as a *different* showtime, and to every other path that is
+  mere first sight. The copy tells the cases apart via the
+  `state.everAvailable` ledger: a show never once seen buyable rings as
+  "went on sale for REAL" (the whole map is probably opening), a
+  previously-buyable one as returned tickets.
 - **Realtime windows:** `realtime_windows` (Tue 06:00–12:00 ET at 6 s) is the
   drop-hour tier — reported to be when the following weeks' dates go on sale.
   Inside one the watcher stops behaving like a cron job: `realtime_loop()`
-  holds a 55-second slice of tight polling over a single kept-alive TLS
+  holds a 240-second slice of tight polling over a single kept-alive TLS
   connection (21 ms/poll warm vs 54 ms cold), then exits so launchd restarts
   it — crash recovery, the flock and the watchdog stay exactly as they are the
   rest of the week. The daily reconcile is deferred out of these windows,
-  since its ~90 s sweep is the worst blind spot to have during a drop.
+  since its ~90 s sweep is the worst blind spot to have during a drop; due
+  restock checks ride *inside* the loop on the same kept-alive connection,
+  because with placeholder listings armed silently, an armed date flipping
+  buyable is exactly the drop the window exists to catch.
   Fandango offers no push transport (no websocket, no SSE, and it ignores
   `If-None-Match`), so polling is the only option — this is polling made as
   stream-like as the source allows.
@@ -115,9 +125,12 @@ Three paths can reach the same date (the target watch, the probe's instant
 ping, the sweep's detail alert), so `state.announced` is the single ledger:
 whichever path announces a date first claims it, and the others go quiet.
 The horizon still advances past suppressed dates — otherwise the probe
-re-hits the same date forever. Restock alerts dedupe per showtime
-(`state.restockAlerted`) so a seat that flaps sold-out/open rings once.
-Nothing is marked announced unless the push actually delivered, so a failed
+re-hits the same date forever. Restock alerts rate-limit per showtime
+(`state.restockAlerted`, `restock_realert_seconds`, 30 min default) so a
+seat that flaps sold-out/open can't spam, without turning one missed alert
+into a permanent mute — and a delivered restock ring claims its date in
+`state.announced` like any other path. Nothing is marked announced — and no
+restock baseline advances — unless the push actually delivered, so a failed
 alert retries next cycle. `instant_alert: false` collapses the two-stage
 "detected now, details in ~1 min" ping into a single alert.
 

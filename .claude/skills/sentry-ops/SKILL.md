@@ -44,7 +44,10 @@ an Xcode install once broke `/usr/bin/python3` and killed polling silently.
 - **Residential IP is a design assumption.** Datacenter IPs likely get 403s
   (preflight.py exists to prove a new box before trusting it).
 - **Invariants:** horizon/announced/degradedSent/budgetAlerted advance ONLY
-  on a delivered push (failed push = retry next cycle). One announcement per
+  on a delivered push (failed push = retry next cycle) — and since
+  2026-07-30 so do `seenAvailability` baselines for alert-worthy flips in
+  `restock_check` (advancing on a failed push files the flip as old news
+  and the alert never retries). One announcement per
   date via `state.announced`, whichever path wins — and `target_check` MUST
   run before the probe/sweep in `main()` (pinned by test) or the drop path
   claims target dates, corrupting `targetAlerted`. Unconfigured channel must
@@ -70,13 +73,26 @@ an Xcode install once broke `/usr/bin/python3` and killed polling silently.
   answers 200 with the full 15.5KB). Polling is the only option — don't
   re-investigate websockets.
 - **Realtime windows** (`realtime_windows`, currently Tue 06:00–12:00 ET at
-  6s) hand the cycle to `realtime_loop()`: 55-second slices of tight polling
+  6s) hand the cycle to `realtime_loop()`: 240-second slices of tight polling
   over one kept-alive TLS connection (21ms/poll warm vs 54ms cold, measured).
   Slices keep launchd supervision, the flock and the watchdog unchanged.
   `lastPollAt` updates every pass; state persists immediately on a drop;
   sleep is floored at 0.5s so no config typo can hammer the endpoint. The
   daily reconcile is deliberately deferred out of these windows — its ~90s
-  sweep is the worst possible blind spot during a drop hour.
+  sweep is the worst possible blind spot during a drop hour. Due restock
+  checks are NOT deferred (since 2026-07-30): they ride inside the loop on
+  the kept-alive session, because placeholder listings arm silently and the
+  armed-date flip is precisely this window's drop.
+- **Placeholder handling** (2026-07-30): listings that arrive already sold
+  out announce silently and arm the sniper; `restock_check` owns the only
+  ring those dates ever get. It fires on soldout/restricted→available flips
+  AND on a brand-new buyable qualifying slot appearing on an armed,
+  previously-observed date (AMC swapping the fake time for the real one) —
+  `scan_dates` deliberately leaves exactly those keys unseeded. The
+  monotonic `state.everAvailable` ledger picks the copy: never-seen-buyable
+  → "went on sale for REAL", else "returned tickets". A date with no
+  observed keys still baselines silently (freshly pinned watch date ≠
+  news — the gap-walk trap).
 
 ## Alarms and what they mean
 
