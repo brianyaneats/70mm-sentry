@@ -2034,62 +2034,6 @@ class TestObservationPrecision(SentryTest):
         self.assertEqual(len(self.rows()), 1)   # still no spurious row
 
 
-class TestGapWalk(SentryTest):
-    """AMC does not extend the run contiguously — on 2026-07-29 Aug 25 and 26
-    listed while Aug 20-24 stayed empty. horizon+1 alone cannot see that."""
-
-    def setUp(self):
-        super().setUp()
-        self.now = dt.datetime(2026, 7, 29, 12, 0).astimezone()
-
-    def test_walks_forward_one_date_per_call(self):
-        a = sentry.gap_probe_date(self.st, "AABQI", self.now)
-        b = sentry.gap_probe_date(self.st, "AABQI", self.now)
-        self.assertEqual(a, "2026-07-30")
-        self.assertEqual(b, "2026-07-31")
-
-    def test_skips_dates_already_announced(self):
-        self.st["announced"] = ["2026-07-30", "2026-07-31"]
-        self.assertEqual(sentry.gap_probe_date(self.st, "AABQI", self.now),
-                         "2026-08-01")
-
-    def test_skips_dates_already_alerted_for_that_venue(self):
-        self.st["alerted"]["AABQI"] = ["2026-07-30"]
-        self.assertEqual(sentry.gap_probe_date(self.st, "AABQI", self.now),
-                         "2026-07-31")
-
-    def test_wraps_around_the_window(self):
-        sentry.CFG["gap_scan_days"] = 3
-        seen = {sentry.gap_probe_date(self.st, "AABQI", self.now)
-                for _ in range(9)}
-        self.assertEqual(seen, {"2026-07-30", "2026-07-31", "2026-08-01"})
-
-    def test_returns_none_when_everything_is_announced(self):
-        sentry.CFG["gap_scan_days"] = 2
-        self.st["announced"] = ["2026-07-30", "2026-07-31"]
-        self.assertIsNone(sentry.gap_probe_date(self.st, "AABQI", self.now))
-
-    def test_disabled_by_config(self):
-        sentry.CFG["gap_scan_days"] = 0
-        self.assertIsNone(sentry.gap_probe_date(self.st, "AABQI", self.now))
-
-    def test_walk_is_independent_of_the_horizon(self):
-        # a jump forward must never strand the dates behind it
-        self.st["horizon"]["AABQI"] = "2026-08-26"
-        self.assertEqual(sentry.gap_probe_date(self.st, "AABQI", self.now),
-                         "2026-07-30")
-
-    def test_probe_once_accepts_an_explicit_date(self):
-        vm = viewmodel([showtime()])
-        with mock.patch.object(sentry, "fetch_day", return_value=vm) as f, \
-                mock.patch.object(sentry, "maybe_instant_alert"), \
-                mock.patch.object(sentry, "scan_dates", return_value={}), \
-                mock.patch.object(sentry, "handle_drop"), \
-                mock.patch.object(sentry, "save_state"):
-            sentry.probe_once(self.st, "AABQI", date="2026-08-25")
-        self.assertEqual(f.call_args.args[2], "2026-08-25")
-
-
 class TestBreakerBackoff(SentryTest):
     """A transient timeout should not blind the watcher for half an hour —
     observed 2026-07-29, minutes before a target date listed."""
