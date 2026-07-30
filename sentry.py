@@ -1084,7 +1084,14 @@ def restock_alert_due(st, key, now):
 
 
 def restock_check(st, venue, dates, now=None):
-    """Poll the given dates; alert on soldout/restricted → available flips."""
+    """Poll the given dates; alert on soldout/restricted → available flips.
+
+    A baseline may advance to "available" only once a push has actually
+    DELIVERED. Writing it before the push files the flip as old news, so a
+    one-cycle channel outage would eat the only alert this watcher exists to
+    send — every later poll sees available→available and stays quiet. A flip
+    inside the re-alert cooldown still advances silently: the phone rang for
+    that showtime minutes ago."""
     now = now or dt.datetime.now().astimezone()
     freed = []
     for date in dates:
@@ -1100,10 +1107,12 @@ def restock_check(st, venue, dates, now=None):
                 continue
             key = f"{venue}|{date}|{h['time']}"
             prev = st["seenAvailability"].get(key)
+            if (prev in ("soldout", "restricted")
+                    and h["type"] == "available"
+                    and restock_alert_due(st, key, now)):
+                freed.append((date, h["time"], h.get("url"), key))
+                continue  # baseline advances on delivery, below
             st["seenAvailability"][key] = h["type"]
-            if prev in ("soldout", "restricted") and h["type"] == "available":
-                if restock_alert_due(st, key, now):
-                    freed.append((date, h["time"], h.get("url"), key))
     if freed:
         vcfg = CFG["venues"][venue]
         lines = [f"A sold-out show at {vcfg['name']} just reopened "
@@ -1115,6 +1124,7 @@ def restock_check(st, venue, dates, now=None):
         if push(f"🎟️ Seats just opened — {vcfg['name']}",
                 "\n".join(lines), audience="all"):
             for *_, key in freed:
+                st["seenAvailability"][key] = "available"
                 st["restockAlerted"][key] = now.isoformat()
 
 

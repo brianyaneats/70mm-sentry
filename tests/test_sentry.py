@@ -2122,6 +2122,41 @@ class TestRestockCooldown(SentryTest):
             sentry.restock_check(self.st, "AABQI", ["2026-08-21"], self.now)
         self.assertTrue(sentry.restock_alert_due(self.st, self.KEY, self.now))
 
+    def test_failed_push_keeps_the_flip_pending(self):
+        # a channel outage during THE flip must not file it as old news: the
+        # baseline may only advance once a push has actually delivered
+        vm = viewmodel([showtime()])
+        self.st["seenAvailability"][self.KEY] = "soldout"
+        with mock.patch.object(sentry, "fetch_day", return_value=vm), \
+                mock.patch.object(sentry, "push", return_value=False):
+            sentry.restock_check(self.st, "AABQI", ["2026-08-21"], self.now)
+        self.assertEqual(self.st["seenAvailability"][self.KEY], "soldout")
+
+    def test_failed_push_rings_once_the_channel_recovers(self):
+        vm = viewmodel([showtime()])
+        self.st["seenAvailability"][self.KEY] = "soldout"
+        with mock.patch.object(sentry, "fetch_day", return_value=vm):
+            with mock.patch.object(sentry, "push", return_value=False):
+                sentry.restock_check(self.st, "AABQI", ["2026-08-21"],
+                                     self.now)
+            with mock.patch.object(sentry, "push", return_value=True) as p:
+                sentry.restock_check(self.st, "AABQI", ["2026-08-21"],
+                                     self.now)
+        p.assert_called_once()
+        self.assertEqual(self.st["seenAvailability"][self.KEY], "available")
+
+    def test_cooldown_suppressed_flip_still_advances_the_baseline(self):
+        # inside the cooldown the phone rang for this showtime minutes ago;
+        # the seat being available is old news and must not re-detect forever
+        vm = viewmodel([showtime()])
+        self.st["seenAvailability"][self.KEY] = "soldout"
+        self.st["restockAlerted"][self.KEY] = self.now.isoformat()
+        with mock.patch.object(sentry, "fetch_day", return_value=vm), \
+                mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.restock_check(self.st, "AABQI", ["2026-08-21"], self.now)
+        p.assert_not_called()
+        self.assertEqual(self.st["seenAvailability"][self.KEY], "available")
+
 
 class TestNoAlertOnSoldOutListing(SentryTest):
     """AMC posts placeholder showtimes already sold out — observed
