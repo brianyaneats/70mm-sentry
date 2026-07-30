@@ -856,7 +856,7 @@ def fmt_dates(datelist):
     return a if a == b else f"{a}–{b}"
 
 
-def maybe_instant_alert(st, venue, probe_date):
+def maybe_instant_alert(st, venue, probe_date, hits=None):
     """Ring immediately on probe hit — the detail push follows after the
     sweep (~1 min). Deduped per probe date so a failed detail push doesn't
     re-ring every cycle."""
@@ -865,6 +865,12 @@ def maybe_instant_alert(st, venue, probe_date):
     # the two-stage ping is one event, not two dates; suppress it entirely
     # when the date was already announced elsewhere (e.g. the target watch)
     if not CFG.get("instant_alert", True) or not announce_ok(st, probe_date):
+        return
+    # speed is the whole point of this ping, but not for a listing with
+    # nothing buyable — AMC posts those already sold out
+    if (hits is not None
+            and not any(h["type"] == "available" for h in hits)
+            and not CFG.get("alert_on_soldout_listing", False)):
         return
     vcfg = CFG["venues"][venue]
     if push(f"🎬 Odyssey 70mm — new dates dropping now",
@@ -926,6 +932,21 @@ def target_check(st, now):
             vcfg = CFG["venues"][venue]
             open_ = [h for h in slots if h["type"] == "available"]
             gone = [h for h in slots if h["type"] != "available"]
+            if not open_ and not CFG.get("alert_on_soldout_listing", False):
+                # AMC lists these already sold out — observed 2026-07-29, when
+                # every target date appeared with its single 70mm show gone.
+                # A listing with nothing buyable is not news you can act on,
+                # so hand it straight to the refund sniper and stay silent.
+                # The date is marked handled so this does not re-evaluate
+                # every poll, and restock_check owns the alert that matters:
+                # the moment a seat actually comes back.
+                st["targetAlerted"].append(date)
+                mark_announced(st, [date])
+                st["autoRestockDates"] = sorted(
+                    set(st["autoRestockDates"]) | {date})
+                log(f"{date} listed but every qualifying slot is sold out — "
+                    f"no alert; refund watch armed")
+                continue
             lines = [f"{pretty_date(date)} just went on sale at "
                      f"{vcfg['name']} ({vcfg['tz_label']}).", ""]
             for h in open_:
@@ -1152,7 +1173,7 @@ def probe_once(st, venue, session=None, date=None):
     log(f"PROBE HIT {venue} {probe_date} — sweeping")
     # ring first, enumerate second: the sweep costs ~a minute and the phone
     # should already be buzzing while it runs
-    maybe_instant_alert(st, venue, probe_date)
+    maybe_instant_alert(st, venue, probe_date, hits)
     save_state(st)
     dates = [(dt.date.fromisoformat(probe_date) + dt.timedelta(days=i))
              .isoformat() for i in range(CFG["sweep_days"])]
@@ -1260,6 +1281,22 @@ def handle_drop(st, venue, found):
         return
     total = sum(c["total"] for c in new.values())
     open_ = sum(c["open"] for c in new.values())
+    if not open_ and not CFG.get("alert_on_soldout_listing", False):
+        # a batch that lists entirely sold out is a placeholder, not an
+        # opportunity: record it, move the horizon past it, arm the sniper on
+        # the dates the user actually wants, and say nothing
+        st["alerted"][venue].extend(sorted(new))
+        mark_announced(st, new)
+        st["horizon"][venue] = max(max(new), st["horizon"][venue])
+        targets = set(CFG.get("target_dates") or [])
+        arm = (set(new) & targets) if targets else set(new)
+        if arm:
+            st["autoRestockDates"] = sorted(
+                set(st["autoRestockDates"]) | arm)
+        log(f"{len(new)} new date(s) listed fully sold out "
+            f"({fmt_dates(new)}) — no alert; refund watch armed for "
+            f"{sorted(arm) or 'none'}")
+        return
     seats = (f"{open_} with open seats" if open_ == total
              else f"{open_} with open seats, {total - open_} sold out")
     # per-date showtime lines, capped so a big drop still fits one push

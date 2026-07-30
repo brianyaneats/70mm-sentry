@@ -590,9 +590,11 @@ class TestTargetCheck(SentryTest):
         f, p = self.run_target([showtime(time_="7:00p")])
         self.assertIn("https://link.example/ls", p.call_args.args[1])
 
-    def test_soldout_evening_rings_and_arms_refund_sniper(self):
+    def test_soldout_evening_is_silent_but_arms_refund_sniper(self):
+        # contract changed 2026-07-30: AMC posts these already sold out, so a
+        # listing with nothing buyable hands off to the sniper without ringing
         f, p = self.run_target([showtime(time_="7:00p", type_="soldout")])
-        p.assert_called_once()
+        p.assert_not_called()
         self.assertEqual(self.st["autoRestockDates"], ["2026-08-21"])
 
     def test_poll_clock_throttles_refetch(self):
@@ -2119,3 +2121,70 @@ class TestRestockCooldown(SentryTest):
                 mock.patch.object(sentry, "push", return_value=False):
             sentry.restock_check(self.st, "AABQI", ["2026-08-21"], self.now)
         self.assertTrue(sentry.restock_alert_due(self.st, self.KEY, self.now))
+
+
+class TestNoAlertOnSoldOutListing(SentryTest):
+    """AMC posts placeholder showtimes already sold out — observed
+    2026-07-29/30 across Aug 21-29. A listing with nothing buyable is not
+    news; the refund sniper owns it from there."""
+
+    def setUp(self):
+        super().setUp()
+        sentry.CFG["target_dates"] = ["2026-08-21"]
+        sentry.CFG["target_after_hour"] = 18
+        sentry.CFG["target_every_seconds"] = 0
+        self.now = dt.datetime(2026, 8, 1, 12, 0).astimezone()
+
+    def _target_check(self, type_):
+        vm = viewmodel([showtime(type_=type_, time_="6:00p")])
+        with mock.patch.object(sentry, "fetch_day", return_value=vm), \
+                mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.target_check(self.st, self.now)
+        return p
+
+    def test_silent_when_the_listing_is_sold_out(self):
+        self._target_check("soldout").assert_not_called()
+
+    def test_still_alerts_when_a_seat_is_buyable(self):
+        self._target_check("available").assert_called_once()
+
+    def test_sold_out_listing_arms_the_refund_sniper(self):
+        self._target_check("soldout")
+        self.assertIn("2026-08-21", self.st["autoRestockDates"])
+
+    def test_sold_out_listing_is_not_re_evaluated_every_poll(self):
+        self._target_check("soldout")
+        self.assertIn("2026-08-21", self.st["targetAlerted"])
+        self.assertFalse(sentry.announce_ok(self.st, "2026-08-21"))
+
+    def test_override_restores_the_old_noisy_behaviour(self):
+        sentry.CFG["alert_on_soldout_listing"] = True
+        self._target_check("soldout").assert_called_once()
+
+    def test_drop_path_stays_silent_on_an_all_soldout_batch(self):
+        found = {"2026-08-28": {"total": 1, "open": 0, "times": []},
+                 "2026-08-29": {"total": 1, "open": 0, "times": []}}
+        with mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.handle_drop(self.st, "AABQI", found)
+        p.assert_not_called()
+        # but the horizon must still move, or the probe re-hits forever
+        self.assertEqual(self.st["horizon"]["AABQI"], "2026-08-29")
+        self.assertFalse(sentry.announce_ok(self.st, "2026-08-28"))
+
+    def test_drop_path_still_alerts_when_something_is_buyable(self):
+        found = {"2026-08-28": {"total": 2, "open": 1, "times": ["7:00p"]}}
+        with mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.handle_drop(self.st, "AABQI", found)
+        p.assert_called_once()
+
+    def test_instant_ping_suppressed_when_nothing_is_buyable(self):
+        hits = [{"time": "6:00p", "type": "soldout"}]
+        with mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.maybe_instant_alert(self.st, "AABQI", "2026-08-28", hits)
+        p.assert_not_called()
+
+    def test_instant_ping_fires_when_a_seat_is_open(self):
+        hits = [{"time": "6:00p", "type": "available"}]
+        with mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.maybe_instant_alert(self.st, "AABQI", "2026-08-28", hits)
+        p.assert_called_once()
