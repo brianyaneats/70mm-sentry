@@ -1116,7 +1116,7 @@ def restock_alert_due(st, key, now):
                                                  1800)
 
 
-def restock_check(st, venue, dates, now=None):
+def restock_check(st, venue, dates, now=None, session=None):
     """Poll the given dates; alert when a watched show becomes buyable.
 
     Two events ring: a known slot flipping soldout/restricted → available (a
@@ -1136,7 +1136,7 @@ def restock_check(st, venue, dates, now=None):
     now = now or dt.datetime.now().astimezone()
     freed = []
     for date in dates:
-        vm = fetch_day(st, venue, date)
+        vm = fetch_day(st, venue, date, session=session)
         if vm is BUDGET:
             return
         if vm is None:
@@ -1293,6 +1293,17 @@ def realtime_loop(st, now):
                 if probe_once(st, venue, session):
                     dropped = True
             target_check(st, now)
+            # the sniper stays on watch in here: placeholder listings arm
+            # silently, so the soldout→available flip on an armed date IS
+            # the drop this window exists for — deferring it with the
+            # reconcile would leave exactly those dates dark for six hours
+            due = restock_due_dates(st, now)
+            if due:
+                for venue in CFG["venues"]:
+                    restock_check(st, venue, due, now=now, session=session)
+                for d in due:
+                    st["restockLastPoll"][d] = now.isoformat()
+                save_state(st)  # a delivered ring must survive a slice seam
             heartbeat(st)                        # self-throttling
             polls += 1
             if dropped or polls % 5 == 0:
@@ -1469,9 +1480,11 @@ def main():
         if push("Sentry daily digest", build_digest(st), priority="low"):
             st["lastDigest"] = today
 
-    # realtime window: hand the whole slice to the tight loop. Everything
-    # below (reconcile, restock, study) is deliberately deferred — during the
-    # hours a drop is expected, nothing competes with watching for it.
+    # realtime window: hand the whole slice to the tight loop. The reconcile
+    # and study below are deliberately deferred — during the hours a drop is
+    # expected, their long sweeps compete with watching for it. Restock
+    # checks are NOT deferred: they ride inside the loop on their own clock,
+    # because an armed date flipping buyable is precisely this window's drop.
     if realtime_interval(now):
         realtime_loop(st, now)
         return

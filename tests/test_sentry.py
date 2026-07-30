@@ -492,6 +492,14 @@ class TestRestock(SentryTest):
         self.assertEqual(
             self.st["seenAvailability"]["AABQI|2026-08-15|6:00p"], "soldout")
 
+    def test_session_is_passed_through_to_fetch_day(self):
+        # inside a realtime window the checks ride the kept-alive connection
+        sess = object()
+        with mock.patch.object(sentry, "fetch_day", return_value={}) as f:
+            sentry.restock_check(self.st, "AABQI", ["2026-08-15"],
+                                 session=sess)
+        self.assertIs(f.call_args.kwargs["session"], sess)
+
 
 class TestRestockWatchlist(SentryTest):
     def test_merges_config_and_auto_and_prunes_past(self):
@@ -1776,6 +1784,7 @@ class TestRealtimeLoop(SentryTest):
                 mock.patch.object(sentry, "realtime_seconds_left",
                                   return_value=9999), \
                 mock.patch.object(sentry, "target_check"), \
+                mock.patch.object(sentry, "restock_check"), \
                 mock.patch.object(sentry, "heartbeat"), \
                 mock.patch.object(sentry, "save_state"), \
                 mock.patch.object(sentry, "RealtimeSession"), \
@@ -1814,6 +1823,7 @@ class TestRealtimeLoop(SentryTest):
                 mock.patch.object(sentry, "realtime_seconds_left",
                                   return_value=9999), \
                 mock.patch.object(sentry, "target_check"), \
+                mock.patch.object(sentry, "restock_check"), \
                 mock.patch.object(sentry, "heartbeat"), \
                 mock.patch.object(sentry, "RealtimeSession"), \
                 mock.patch.object(sentry, "probe_once", return_value=True), \
@@ -1828,6 +1838,7 @@ class TestRealtimeLoop(SentryTest):
                 mock.patch.object(sentry, "realtime_seconds_left",
                                   return_value=9999), \
                 mock.patch.object(sentry, "target_check"), \
+                mock.patch.object(sentry, "restock_check"), \
                 mock.patch.object(sentry, "heartbeat"), \
                 mock.patch.object(sentry, "save_state"), \
                 mock.patch.object(sentry, "probe_once",
@@ -1836,6 +1847,44 @@ class TestRealtimeLoop(SentryTest):
             with self.assertRaises(RuntimeError):
                 sentry.realtime_loop(self.st, self.now)
         S.return_value.close.assert_called_once()
+
+    def test_restock_rides_the_realtime_session(self):
+        # placeholder listings arm silently, so the flip on an armed date is
+        # exactly this window's drop — the sniper must not sit out the slice
+        with mock.patch.object(sentry, "REALTIME_SLICE", 0.2), \
+                mock.patch.object(sentry, "realtime_interval",
+                                  return_value=0.05), \
+                mock.patch.object(sentry, "realtime_seconds_left",
+                                  return_value=9999), \
+                mock.patch.object(sentry, "target_check"), \
+                mock.patch.object(sentry, "heartbeat"), \
+                mock.patch.object(sentry, "save_state"), \
+                mock.patch.object(sentry, "RealtimeSession") as S, \
+                mock.patch.object(sentry, "probe_once", return_value=False), \
+                mock.patch.object(sentry, "restock_due_dates",
+                                  return_value=["2026-08-21"]), \
+                mock.patch.object(sentry, "restock_check") as rc:
+            sentry.realtime_loop(self.st, self.now)
+        self.assertGreater(rc.call_count, 0)
+        self.assertIs(rc.call_args.kwargs["session"], S.return_value)
+        self.assertIn("2026-08-21", self.st["restockLastPoll"])
+
+    def test_no_due_dates_no_restock_traffic(self):
+        with mock.patch.object(sentry, "REALTIME_SLICE", 0.2), \
+                mock.patch.object(sentry, "realtime_interval",
+                                  return_value=0.05), \
+                mock.patch.object(sentry, "realtime_seconds_left",
+                                  return_value=9999), \
+                mock.patch.object(sentry, "target_check"), \
+                mock.patch.object(sentry, "heartbeat"), \
+                mock.patch.object(sentry, "save_state"), \
+                mock.patch.object(sentry, "RealtimeSession"), \
+                mock.patch.object(sentry, "probe_once", return_value=False), \
+                mock.patch.object(sentry, "restock_due_dates",
+                                  return_value=[]), \
+                mock.patch.object(sentry, "restock_check") as rc:
+            sentry.realtime_loop(self.st, self.now)
+        rc.assert_not_called()
 
 
 class TestRealtimeSession(SentryTest):
