@@ -151,6 +151,7 @@ def default_state():
         "targetLastPoll": {},
         "announced": [],
         "restockAlerted": {},
+        "everAvailable": [],
         "histSeen": {},
         "histSeenAt": {},
         "studyLastPoll": {},
@@ -167,12 +168,29 @@ def mark_announced(st, dates):
     st["announced"] = sorted(set(st.get("announced", [])) | set(dates))
 
 
+def mark_ever_available(st, key):
+    """Monotonic: this showtime has been OBSERVED buyable at least once.
+    Splits a placeholder resolving into its real on-sale (never seen
+    available — the whole map is probably opening) from a returned seat
+    (was buyable, sold out, came back): the two ring with different copy."""
+    ea = st.setdefault("everAvailable", [])
+    if key not in ea:
+        ea.append(key)
+
+
 def load_state():
     if not os.path.exists(STATE_PATH):
         return default_state()
     st = json.load(open(STATE_PATH))
     merged = default_state()
     merged.update(st)
+    if "everAvailable" not in st:
+        # upgrade: anything currently seen available has evidently been
+        # available — without this, the first flip after deploy would read
+        # as a placeholder's first on-sale instead of a returned seat
+        merged["everAvailable"] = sorted(
+            k for k, v in merged["seenAvailability"].items()
+            if v == "available")
     return merged
 
 
@@ -832,6 +850,8 @@ def scan_dates(st, venue, dates):
                 # news before the sniper ever saw it.
                 continue
             st["seenAvailability"].setdefault(key, h["type"])
+            if h["type"] == "available":
+                mark_ever_available(st, key)
         if hits:
             found[d] = {"total": len(hits),
                         "open": sum(1 for h in hits
@@ -936,8 +956,10 @@ def target_check(st, now):
             slots = [h for h in odyssey_70mm(vm)
                      if slot_qualifies(h["time"])]
             for h in slots:  # baseline for the refund sniper (first sight)
-                st["seenAvailability"].setdefault(
-                    f"{venue}|{date}|{h['time']}", h["type"])
+                key = f"{venue}|{date}|{h['time']}"
+                st["seenAvailability"].setdefault(key, h["type"])
+                if h["type"] == "available":
+                    mark_ever_available(st, key)
             if not slots:
                 continue
             vcfg = CFG["venues"][venue]
@@ -1136,34 +1158,40 @@ def restock_check(st, venue, dates, now=None):
                               "flip" if flip else "new"))
                 continue  # baseline advances on delivery, below
             st["seenAvailability"][key] = h["type"]
+            if h["type"] == "available":
+                mark_ever_available(st, key)
     if freed:
         vcfg = CFG["venues"][venue]
-        new = [f for f in freed if f[4] == "new"]
-        flips = [f for f in freed if f[4] == "flip"]
+        ever = st.setdefault("everAvailable", [])
+        fresh = [f for f in freed if f[3] not in ever]  # never seen buyable
+        back = [f for f in freed if f[3] in ever]       # was buyable before
         lines = []
-        if new:
-            lines += [f"A showtime just APPEARED on a watched date at "
-                      f"{vcfg['name']} ({vcfg['tz_label']}) — AMC swapping a "
-                      f"placeholder for the real listing looks exactly like "
-                      f"this, so the whole map may be open:", ""]
-            for date, t, url, _, _ in new:
-                lines.append(f"🎟  NEW — {pretty_date(date)}, "
+        if fresh:
+            lines += [f"Tickets just went on sale for REAL at "
+                      f"{vcfg['name']} ({vcfg['tz_label']}) — these shows "
+                      f"had been listed sold out from the moment they "
+                      f"appeared (AMC's placeholder pattern), so the whole "
+                      f"seat map may just have opened:", ""]
+            for date, t, url, _, kind in fresh:
+                tag = "NEW — " if kind == "new" else ""
+                lines.append(f"🎟  {tag}{pretty_date(date)}, "
                              f"{pretty_time(t)} — tap to pick seats:\n"
                              f"{url or vcfg['link']}")
             lines.append("")
-        if flips:
+        if back:
             lines += [f"A sold-out show at {vcfg['name']} just reopened "
                       f"({vcfg['tz_label']}) — someone likely returned "
                       f"tickets. These go fast:", ""]
-            for date, t, url, _, _ in flips:
+            for date, t, url, _, _ in back:
                 lines.append(f"🎟  {pretty_date(date)}, {pretty_time(t)}\n"
                              f"{url or vcfg['link']}")
-        title = (f"🎬 New showtime just appeared — {vcfg['name']}" if new
+        title = (f"🎬 Tickets just went on sale — {vcfg['name']}" if fresh
                  else f"🎟️ Seats just opened — {vcfg['name']}")
         if push(title, "\n".join(lines).rstrip(), audience="all"):
             for date, t, url, key, _ in freed:
                 st["seenAvailability"][key] = "available"
                 st["restockAlerted"][key] = now.isoformat()
+                mark_ever_available(st, key)
             # a ring IS the announcement for its date — without this a
             # later drop-path pass would re-announce a date the user has
             # already been rung for
@@ -1509,6 +1537,9 @@ def main():
                           if k.split("|")[1] >= today}
         st["histSeenAt"] = {k: v for k, v in st.get("histSeenAt", {}).items()
                             if k.split("|")[1] >= today}
+        st["everAvailable"] = sorted(
+            k for k in st.get("everAvailable", [])
+            if k.split("|")[1] >= today)
         heartbeat(st)
         save_state(st)
         snapshot_state(st)

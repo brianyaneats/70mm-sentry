@@ -466,14 +466,24 @@ class TestRestock(SentryTest):
             self.st["seenAvailability"]["AABQI|2026-08-15|6:00p"], "soldout")
 
     def test_soldout_to_available_alerts(self):
+        # contract changed 2026-07-30: a flip on a show never seen buyable
+        # is the placeholder's real on-sale, and the copy now says so
         self.st["seenAvailability"]["AABQI|2026-08-15|6:00p"] = "soldout"
         p = self.run_check([showtime(type_="available", time_="6:00p",
                                      url="https://tickets.example/jump?y=2")])
         p.assert_called_once()
-        self.assertIn("Seats just opened", p.call_args.args[0])
+        self.assertIn("Tickets just went on sale", p.call_args.args[0])
         self.assertIn("Sat, Aug 15, 6:00 PM", p.call_args.args[1])
         self.assertIn("https://tickets.example/jump?y=2",
                       p.call_args.args[1])
+
+    def test_flip_on_a_previously_buyable_show_reads_as_a_refund(self):
+        self.st["seenAvailability"]["AABQI|2026-08-15|6:00p"] = "soldout"
+        sentry.mark_ever_available(self.st, "AABQI|2026-08-15|6:00p")
+        p = self.run_check([showtime(type_="available", time_="6:00p")])
+        p.assert_called_once()
+        self.assertIn("Seats just opened", p.call_args.args[0])
+        self.assertIn("returned tickets", p.call_args.args[1])
 
     def test_available_to_soldout_updates_without_alert(self):
         self.st["seenAvailability"]["AABQI|2026-08-15|6:00p"] = "available"
@@ -1458,14 +1468,15 @@ class TestAvailabilitySeeding(SentryTest):
 
     def test_seeded_baseline_lets_first_restock_poll_catch_flip(self):
         # reconcile saw it soldout; seat returned before the first dedicated
-        # restock poll — previously treated as baseline, flip lost
+        # restock poll — previously treated as baseline, flip lost. (Never
+        # seen buyable → since 2026-07-30 it rings with the on-sale copy.)
         self.st["seenAvailability"]["AABQI|2026-08-20|6:00p"] = "soldout"
         vm = viewmodel([showtime(url="https://buy.example/x")])
         with mock.patch.object(sentry, "fetch_day", return_value=vm), \
                 mock.patch.object(sentry, "push", return_value=True) as p:
             sentry.restock_check(self.st, "AABQI", ["2026-08-20"])
         p.assert_called_once()
-        self.assertIn("reopened", p.call_args.args[1])
+        self.assertIn("went on sale", p.call_args.args[1])
 
 
 class TestElapsedSeconds(SentryTest):
@@ -2255,7 +2266,7 @@ class TestNewSlotAlert(SentryTest):
                               showtime(time_="7:30p",
                                        url="https://buy.example/n")])
         p.assert_called_once()
-        self.assertIn("New showtime", p.call_args.args[0])
+        self.assertIn("Tickets just went on sale", p.call_args.args[0])
         self.assertIn("NEW — Fri, Aug 21, 7:30 PM", p.call_args.args[1])
         self.assertIn("https://buy.example/n", p.call_args.args[1])
 
@@ -2304,7 +2315,10 @@ class TestNewSlotAlert(SentryTest):
                          self.st["seenAvailability"])
 
     def test_new_slot_and_flip_share_one_push(self):
+        # a refund flip (was buyable once) and a brand-new slot land in one
+        # message, each under its own header
         self.st["seenAvailability"][f"AABQI|{self.DATE}|6:00p"] = "soldout"
+        sentry.mark_ever_available(self.st, f"AABQI|{self.DATE}|6:00p")
         p = self.run_restock([showtime(time_="6:00p"),
                               showtime(time_="7:30p")])
         p.assert_called_once()
@@ -2357,3 +2371,90 @@ class TestScanYieldsNewSlotsToSniper(SentryTest):
         self.assertEqual(
             self.st["seenAvailability"][f"AABQI|{self.DATE}|7:30p"],
             "soldout")
+
+
+class TestFirstOnSaleCopy(SentryTest):
+    """Since 6216200, placeholder listings announce silently — the restock
+    flip is the only ring the user ever gets for those dates. A show that
+    was never once seen buyable is a placeholder resolving into its real
+    on-sale (whole map opening); a show that was buyable before is a
+    returned seat. Same trigger, very different news."""
+
+    KEY = "AABQI|2026-08-21|6:00p"
+
+    def setUp(self):
+        super().setUp()
+        self.st["seenAvailability"][self.KEY] = "soldout"
+        self.now = dt.datetime.now().astimezone()
+
+    def flip(self, push_ok=True):
+        vm = viewmodel([showtime()])
+        with mock.patch.object(sentry, "fetch_day", return_value=vm), \
+             mock.patch.object(sentry, "push", return_value=push_ok) as p:
+            sentry.restock_check(self.st, "AABQI", ["2026-08-21"], self.now)
+        return p
+
+    def test_never_buyable_flip_reads_as_the_real_on_sale(self):
+        p = self.flip()
+        self.assertIn("Tickets just went on sale", p.call_args.args[0])
+        self.assertIn("placeholder", p.call_args.args[1])
+        self.assertNotIn("returned tickets", p.call_args.args[1])
+
+    def test_previously_buyable_flip_reads_as_a_returned_seat(self):
+        sentry.mark_ever_available(self.st, self.KEY)
+        p = self.flip()
+        self.assertIn("Seats just opened", p.call_args.args[0])
+        self.assertIn("returned tickets", p.call_args.args[1])
+        self.assertNotIn("placeholder", p.call_args.args[1])
+
+    def test_delivered_ring_marks_ever_available(self):
+        self.flip()
+        self.assertIn(self.KEY, self.st["everAvailable"])
+
+    def test_failed_push_marks_nothing(self):
+        # the copy must still read "first on-sale" when the retry delivers
+        self.flip(push_ok=False)
+        self.assertNotIn(self.KEY, self.st.get("everAvailable", []))
+        p = self.flip()
+        self.assertIn("Tickets just went on sale", p.call_args.args[0])
+
+    def test_observation_paths_record_the_fact(self):
+        # target_check and scan_dates saw it buyable → later flips are
+        # refunds, not first on-sales
+        sentry.CFG["target_dates"] = ["2033-08-21"]
+        vm = viewmodel([showtime(time_="7:00p")])
+        with mock.patch.object(sentry, "fetch_day", return_value=vm), \
+                mock.patch.object(sentry, "push", return_value=True):
+            sentry.target_check(self.st, dt.datetime(2033, 8, 1, 12, 0))
+        self.assertIn("AABQI|2033-08-21|7:00p", self.st["everAvailable"])
+        with mock.patch.object(sentry, "fetch_day", return_value=vm):
+            sentry.scan_dates(self.st, "AABQI", ["2033-08-02"])
+        self.assertIn("AABQI|2033-08-02|7:00p", self.st["everAvailable"])
+
+    def test_state_upgrade_seeds_from_current_baselines(self):
+        # a pre-upgrade state has no everAvailable ledger; whatever is seen
+        # available right now has evidently been available
+        old = {"seenAvailability": {"AABQI|2026-08-21|6:00p": "soldout",
+                                    "AABQI|2026-08-22|6:00p": "available"}}
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump(old, f)
+        try:
+            with mock.patch.object(sentry, "STATE_PATH", path):
+                st = sentry.load_state()
+        finally:
+            os.unlink(path)
+        self.assertEqual(st["everAvailable"], ["AABQI|2026-08-22|6:00p"])
+
+    def test_state_with_ledger_is_not_reseeded(self):
+        old = {"seenAvailability": {"AABQI|2026-08-22|6:00p": "available"},
+               "everAvailable": []}
+        fd, path = tempfile.mkstemp(suffix=".json")
+        with os.fdopen(fd, "w") as f:
+            json.dump(old, f)
+        try:
+            with mock.patch.object(sentry, "STATE_PATH", path):
+                st = sentry.load_state()
+        finally:
+            os.unlink(path)
+        self.assertEqual(st["everAvailable"], [])
