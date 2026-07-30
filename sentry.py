@@ -803,6 +803,7 @@ def scan_dates(st, venue, dates):
     fetch broke mid-scan (breaker handles it)."""
     found = {}
     empties = 0
+    watch = set(restock_watchlist(st))
     for i, d in enumerate(dates):
         if i:
             time.sleep(CFG["sweep_spacing_seconds"] + random.uniform(0, 2))
@@ -819,8 +820,18 @@ def scan_dates(st, venue, dates):
         # so a date's very first dedicated restock poll can already detect
         # a flip instead of treating it as baseline
         for h in hits:
-            st["seenAvailability"].setdefault(
-                f"{venue}|{d}|{h['time']}", h["type"])
+            key = f"{venue}|{d}|{h['time']}"
+            if (h["type"] == "available"
+                    and key not in st["seenAvailability"]
+                    and d in watch and not announce_ok(st, d)
+                    and slot_qualifies(h["time"])):
+                # a brand-new buyable slot on an armed, already-announced
+                # date is restock_check's alert to ring (AMC swapping a
+                # placeholder time for the real one). This scan races the
+                # sniper's clock — seeding here would file the slot as old
+                # news before the sniper ever saw it.
+                continue
+            st["seenAvailability"].setdefault(key, h["type"])
         if hits:
             found[d] = {"total": len(hits),
                         "open": sum(1 for h in hits
@@ -1084,7 +1095,15 @@ def restock_alert_due(st, key, now):
 
 
 def restock_check(st, venue, dates, now=None):
-    """Poll the given dates; alert on soldout/restricted → available flips.
+    """Poll the given dates; alert when a watched show becomes buyable.
+
+    Two events ring: a known slot flipping soldout/restricted → available (a
+    returned seat — or a placeholder resolving), and a brand-new available
+    slot appearing on a date we have observed before (AMC swapping a
+    placeholder time for the real one; to every seeding path that is mere
+    "first sight" and used to pass silently). A date with no keys at all is
+    still just first observation — a freshly pinned watch date must baseline
+    quietly, not ring stale news.
 
     A baseline may advance to "available" only once a push has actually
     DELIVERED. Writing it before the push files the flip as old news, so a
@@ -1102,30 +1121,53 @@ def restock_check(st, venue, dates, now=None):
             breaker_fail(st)
             return
         breaker_success(st)
+        prefix = f"{venue}|{date}|"
+        date_known = any(k.startswith(prefix) for k in st["seenAvailability"])
         for h in odyssey_70mm(vm):
             if not slot_qualifies(h["time"]):
                 continue
             key = f"{venue}|{date}|{h['time']}"
             prev = st["seenAvailability"].get(key)
-            if (prev in ("soldout", "restricted")
-                    and h["type"] == "available"
+            flip = prev in ("soldout", "restricted")
+            newly = prev is None and date_known
+            if ((flip or newly) and h["type"] == "available"
                     and restock_alert_due(st, key, now)):
-                freed.append((date, h["time"], h.get("url"), key))
+                freed.append((date, h["time"], h.get("url"), key,
+                              "flip" if flip else "new"))
                 continue  # baseline advances on delivery, below
             st["seenAvailability"][key] = h["type"]
     if freed:
         vcfg = CFG["venues"][venue]
-        lines = [f"A sold-out show at {vcfg['name']} just reopened "
-                 f"({vcfg['tz_label']}) — someone likely returned tickets. "
-                 f"These go fast:", ""]
-        for date, t, url, _ in freed:
-            lines.append(f"🎟  {pretty_date(date)}, {pretty_time(t)}\n"
-                         f"{url or vcfg['link']}")
-        if push(f"🎟️ Seats just opened — {vcfg['name']}",
-                "\n".join(lines), audience="all"):
-            for *_, key in freed:
+        new = [f for f in freed if f[4] == "new"]
+        flips = [f for f in freed if f[4] == "flip"]
+        lines = []
+        if new:
+            lines += [f"A showtime just APPEARED on a watched date at "
+                      f"{vcfg['name']} ({vcfg['tz_label']}) — AMC swapping a "
+                      f"placeholder for the real listing looks exactly like "
+                      f"this, so the whole map may be open:", ""]
+            for date, t, url, _, _ in new:
+                lines.append(f"🎟  NEW — {pretty_date(date)}, "
+                             f"{pretty_time(t)} — tap to pick seats:\n"
+                             f"{url or vcfg['link']}")
+            lines.append("")
+        if flips:
+            lines += [f"A sold-out show at {vcfg['name']} just reopened "
+                      f"({vcfg['tz_label']}) — someone likely returned "
+                      f"tickets. These go fast:", ""]
+            for date, t, url, _, _ in flips:
+                lines.append(f"🎟  {pretty_date(date)}, {pretty_time(t)}\n"
+                             f"{url or vcfg['link']}")
+        title = (f"🎬 New showtime just appeared — {vcfg['name']}" if new
+                 else f"🎟️ Seats just opened — {vcfg['name']}")
+        if push(title, "\n".join(lines).rstrip(), audience="all"):
+            for date, t, url, key, _ in freed:
                 st["seenAvailability"][key] = "available"
                 st["restockAlerted"][key] = now.isoformat()
+            # a ring IS the announcement for its date — without this a
+            # later drop-path pass would re-announce a date the user has
+            # already been rung for
+            mark_announced(st, {f[0] for f in freed})
 
 
 # Seconds of tight looping per invocation. Every slice ends with a seam —

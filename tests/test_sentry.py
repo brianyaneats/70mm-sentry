@@ -2223,3 +2223,137 @@ class TestNoAlertOnSoldOutListing(SentryTest):
         with mock.patch.object(sentry, "push", return_value=True) as p:
             sentry.maybe_instant_alert(self.st, "AABQI", "2026-08-28", hits)
         p.assert_called_once()
+
+
+class TestNewSlotAlert(SentryTest):
+    """AMC's placeholder pattern can resolve as a DIFFERENT showtime: the
+    fake 6:00p stays sold out (or vanishes) and the real listing appears as
+    a brand-new slot on an already-announced, armed date. To every seeding
+    path that is mere "first sight", so before this alert existed the one
+    event the user was waiting on passed silently."""
+
+    DATE = "2026-08-21"
+
+    def setUp(self):
+        super().setUp()
+        sentry.CFG["restock_watch_dates"] = []
+        self.st["autoRestockDates"] = [self.DATE]
+        sentry.mark_announced(self.st, [self.DATE])
+        # the placeholder slot has been observed → the date is "known"
+        self.st["seenAvailability"][f"AABQI|{self.DATE}|6:00p"] = "soldout"
+        self.now = dt.datetime.now().astimezone()
+
+    def run_restock(self, hits, push_ok=True):
+        with mock.patch.object(sentry, "fetch_day",
+                               return_value=viewmodel(hits)), \
+             mock.patch.object(sentry, "push", return_value=push_ok) as p:
+            sentry.restock_check(self.st, "AABQI", [self.DATE], self.now)
+        return p
+
+    def test_new_buyable_slot_on_known_date_rings(self):
+        p = self.run_restock([showtime(time_="6:00p", type_="soldout"),
+                              showtime(time_="7:30p",
+                                       url="https://buy.example/n")])
+        p.assert_called_once()
+        self.assertIn("New showtime", p.call_args.args[0])
+        self.assertIn("NEW — Fri, Aug 21, 7:30 PM", p.call_args.args[1])
+        self.assertIn("https://buy.example/n", p.call_args.args[1])
+
+    def test_delivered_ring_baselines_and_dedupes(self):
+        self.run_restock([showtime(time_="7:30p")])
+        self.assertEqual(
+            self.st["seenAvailability"][f"AABQI|{self.DATE}|7:30p"],
+            "available")
+        p2 = self.run_restock([showtime(time_="7:30p")])
+        p2.assert_not_called()
+
+    def test_ring_claims_the_announcement_for_its_date(self):
+        self.st["announced"] = []
+        self.run_restock([showtime(time_="7:30p")])
+        self.assertFalse(sentry.announce_ok(self.st, self.DATE))
+
+    def test_new_soldout_slot_seeds_silently(self):
+        p = self.run_restock([showtime(time_="7:30p", type_="soldout")])
+        p.assert_not_called()
+        self.assertEqual(
+            self.st["seenAvailability"][f"AABQI|{self.DATE}|7:30p"],
+            "soldout")
+
+    def test_first_sight_of_a_whole_date_stays_silent(self):
+        # a date with NO observed keys (e.g. a freshly pinned watch date) is
+        # mere first observation, not news — the gap-walk trap in miniature
+        self.st["seenAvailability"] = {}
+        p = self.run_restock([showtime(time_="7:30p")])
+        p.assert_not_called()
+        self.assertEqual(
+            self.st["seenAvailability"][f"AABQI|{self.DATE}|7:30p"],
+            "available")
+
+    def test_failed_push_leaves_the_new_slot_pending(self):
+        self.run_restock([showtime(time_="7:30p")], push_ok=False)
+        self.assertNotIn(f"AABQI|{self.DATE}|7:30p",
+                         self.st["seenAvailability"])
+        p2 = self.run_restock([showtime(time_="7:30p")])
+        p2.assert_called_once()
+
+    def test_unqualifying_slot_neither_rings_nor_seeds_in_target_mode(self):
+        sentry.CFG["target_dates"] = [self.DATE]
+        p = self.run_restock([showtime(time_="10:00a")])
+        p.assert_not_called()
+        self.assertNotIn(f"AABQI|{self.DATE}|10:00a",
+                         self.st["seenAvailability"])
+
+    def test_new_slot_and_flip_share_one_push(self):
+        self.st["seenAvailability"][f"AABQI|{self.DATE}|6:00p"] = "soldout"
+        p = self.run_restock([showtime(time_="6:00p"),
+                              showtime(time_="7:30p")])
+        p.assert_called_once()
+        body = p.call_args.args[1]
+        self.assertIn("NEW — Fri, Aug 21, 7:30 PM", body)
+        self.assertIn("reopened", body)
+
+
+class TestScanYieldsNewSlotsToSniper(SentryTest):
+    """The daily reconcile races the sniper's clock. If it seeds a brand-new
+    buyable slot on an armed date first, restock_check reads it as baseline
+    and the ring is lost — so the scan must leave exactly those keys alone."""
+
+    # restock_watchlist prunes against the real clock, so pin a far-future
+    # date rather than one the suite will silently age past
+    DATE = "2033-08-21"
+
+    def scan(self, hits):
+        with mock.patch.object(sentry, "fetch_day",
+                               return_value=viewmodel(hits)):
+            sentry.scan_dates(self.st, "AABQI", [self.DATE])
+
+    def arm(self):
+        self.st["autoRestockDates"] = [self.DATE]
+        sentry.mark_announced(self.st, [self.DATE])
+
+    def test_new_buyable_slot_on_armed_announced_date_is_not_seeded(self):
+        self.arm()
+        self.scan([showtime(time_="7:30p")])
+        self.assertNotIn(f"AABQI|{self.DATE}|7:30p",
+                         self.st["seenAvailability"])
+
+    def test_new_soldout_slot_still_seeds_and_arms_the_flip(self):
+        self.arm()
+        self.scan([showtime(time_="7:30p", type_="soldout")])
+        self.assertEqual(
+            self.st["seenAvailability"][f"AABQI|{self.DATE}|7:30p"],
+            "soldout")
+
+    def test_unannounced_or_unarmed_dates_seed_as_before(self):
+        self.scan([showtime(time_="7:30p")])
+        self.assertEqual(
+            self.st["seenAvailability"][f"AABQI|{self.DATE}|7:30p"],
+            "available")
+
+    def test_existing_baseline_is_never_clobbered(self):
+        self.arm()
+        self.st["seenAvailability"][f"AABQI|{self.DATE}|7:30p"] = "soldout"
+        self.scan([showtime(time_="7:30p")])
+        self.assertEqual(
+            self.st["seenAvailability"][f"AABQI|{self.DATE}|7:30p"],
+            "soldout")
