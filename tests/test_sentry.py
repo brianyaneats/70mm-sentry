@@ -2058,3 +2058,64 @@ class TestBreakerBackoff(SentryTest):
     def test_base_is_configurable(self):
         sentry.CFG["breaker_base_backoff_seconds"] = 600
         self.assertGreater(self._trip(3), 500)
+
+
+class TestRestockCooldown(SentryTest):
+    """Each target date has exactly ONE 70mm screening, so a permanent mute
+    after the first reopening turns one missed alert into a permanent one."""
+
+    KEY = "AABQI|2026-08-21|6:00p"
+
+    def setUp(self):
+        super().setUp()
+        sentry.CFG["restock_realert_seconds"] = 1800
+        self.now = dt.datetime.now().astimezone()
+
+    def test_first_reopening_always_rings(self):
+        self.assertTrue(sentry.restock_alert_due(self.st, self.KEY, self.now))
+
+    def test_muted_inside_the_cooldown(self):
+        self.st["restockAlerted"][self.KEY] = self.now.isoformat()
+        self.assertFalse(sentry.restock_alert_due(self.st, self.KEY, self.now))
+
+    def test_rings_again_once_the_cooldown_passes(self):
+        self.st["restockAlerted"][self.KEY] = (
+            self.now - dt.timedelta(minutes=31)).isoformat()
+        self.assertTrue(sentry.restock_alert_due(self.st, self.KEY, self.now))
+
+    def test_legacy_list_state_is_migrated_not_crashed(self):
+        self.st["restockAlerted"] = [self.KEY]
+        # converted, dated now: quiet immediately, eligible after the cooldown
+        self.assertFalse(sentry.restock_alert_due(self.st, self.KEY, self.now))
+        self.assertIsInstance(self.st["restockAlerted"], dict)
+        later = self.now + dt.timedelta(minutes=31)
+        self.assertTrue(sentry.restock_alert_due(self.st, self.KEY, later))
+
+    def test_a_flapping_seat_does_not_spam(self):
+        vm = viewmodel([showtime(url="https://buy.example/x")])
+        self.st["seenAvailability"][self.KEY] = "soldout"
+        with mock.patch.object(sentry, "fetch_day", return_value=vm), \
+                mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.restock_check(self.st, "AABQI", ["2026-08-21"], self.now)
+            self.st["seenAvailability"][self.KEY] = "soldout"   # flapped back
+            sentry.restock_check(self.st, "AABQI", ["2026-08-21"], self.now)
+        self.assertEqual(p.call_count, 1)
+
+    def test_a_later_refund_still_rings(self):
+        vm = viewmodel([showtime(url="https://buy.example/x")])
+        self.st["seenAvailability"][self.KEY] = "soldout"
+        with mock.patch.object(sentry, "fetch_day", return_value=vm), \
+                mock.patch.object(sentry, "push", return_value=True) as p:
+            sentry.restock_check(self.st, "AABQI", ["2026-08-21"], self.now)
+            self.st["seenAvailability"][self.KEY] = "soldout"
+            sentry.restock_check(self.st, "AABQI", ["2026-08-21"],
+                                 self.now + dt.timedelta(minutes=31))
+        self.assertEqual(p.call_count, 2)
+
+    def test_failed_push_leaves_it_eligible_to_retry(self):
+        vm = viewmodel([showtime()])
+        self.st["seenAvailability"][self.KEY] = "soldout"
+        with mock.patch.object(sentry, "fetch_day", return_value=vm), \
+                mock.patch.object(sentry, "push", return_value=False):
+            sentry.restock_check(self.st, "AABQI", ["2026-08-21"], self.now)
+        self.assertTrue(sentry.restock_alert_due(self.st, self.KEY, self.now))

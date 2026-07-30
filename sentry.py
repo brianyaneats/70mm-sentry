@@ -150,7 +150,7 @@ def default_state():
         "targetAlerted": [],
         "targetLastPoll": {},
         "announced": [],
-        "restockAlerted": [],
+        "restockAlerted": {},
         "histSeen": {},
         "histSeenAt": {},
         "studyLastPoll": {},
@@ -1039,8 +1039,32 @@ def poll_interval(now):
     return CFG.get("base_interval_seconds", 60)
 
 
-def restock_check(st, venue, dates):
+def restock_alert_due(st, key, now):
+    """Whether this showtime may ring again.
+
+    Muting a showtime permanently after one alert was wrong for the case that
+    matters: each target date has exactly ONE 70mm screening, so the first
+    reopening is the only notification you would ever get. Miss it while
+    asleep and a later refund on that same show is silent forever. A cooldown
+    still stops a flapping seat spamming the channel, without turning one
+    missed alert into a permanent one."""
+    ra = st.get("restockAlerted")
+    if isinstance(ra, list):
+        # legacy shape: a bare list of permanently-muted keys. Convert, dated
+        # now, so nothing re-rings instantly on upgrade but everything is
+        # eligible again once the cooldown passes.
+        ra = {k: now.isoformat() for k in ra}
+        st["restockAlerted"] = ra
+    last = ra.get(key)
+    if not last:
+        return True
+    return elapsed_seconds(now, last) >= CFG.get("restock_realert_seconds",
+                                                 1800)
+
+
+def restock_check(st, venue, dates, now=None):
     """Poll the given dates; alert on soldout/restricted → available flips."""
+    now = now or dt.datetime.now().astimezone()
     freed = []
     for date in dates:
         vm = fetch_day(st, venue, date)
@@ -1057,9 +1081,7 @@ def restock_check(st, venue, dates):
             prev = st["seenAvailability"].get(key)
             st["seenAvailability"][key] = h["type"]
             if prev in ("soldout", "restricted") and h["type"] == "available":
-                # once per showtime: a seat that flaps sold-out/open would
-                # otherwise re-ring on every flip
-                if key not in st["restockAlerted"]:
+                if restock_alert_due(st, key, now):
                     freed.append((date, h["time"], h.get("url"), key))
     if freed:
         vcfg = CFG["venues"][venue]
@@ -1071,7 +1093,8 @@ def restock_check(st, venue, dates):
                          f"{url or vcfg['link']}")
         if push(f"🎟️ Seats just opened — {vcfg['name']}",
                 "\n".join(lines), audience="all"):
-            st["restockAlerted"].extend(k for *_, k in freed)
+            for *_, key in freed:
+                st["restockAlerted"][key] = now.isoformat()
 
 
 # Seconds of tight looping per invocation. Every slice ends with a seam —
@@ -1384,6 +1407,10 @@ def main():
             if k.split("|")[1] >= today}
         st["restockLastPoll"] = {
             d: t for d, t in st["restockLastPoll"].items() if d >= today}
+        if isinstance(st.get("restockAlerted"), dict):
+            st["restockAlerted"] = {
+                k: v for k, v in st["restockAlerted"].items()
+                if k.split("|")[1] >= today}
         st["targetLastPoll"] = {
             d: t for d, t in st["targetLastPoll"].items() if d >= today}
         st["studyLastPoll"] = {

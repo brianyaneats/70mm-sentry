@@ -93,5 +93,6 @@
     }
   ],
   "min_request_spacing_seconds": 1.0,
-  "breaker_base_backoff_seconds": 60
+  "breaker_base_backoff_seconds": 60,
+  "restock_realert_seconds": 1800
 }
