@@ -1,0 +1,641 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dropwatch</title>
+<style>
+  :root {
+    --ink: #131517;
+    --ink-64: rgba(19, 21, 23, .64);
+    --ink-44: rgba(19, 21, 23, .44);
+    --hairline: rgba(19, 21, 23, .08);
+    --bg: #F7F8F9;
+    --surface: #FFFFFF;
+    --inverted: #131517;
+    --inverted-ink: #F7F8F9;
+    --radius: 8px;
+    --measure: 448px;
+    --shell: 1120px;
+    --status-green: #1a8754;
+    --status-amber: #b45309;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink: #F2F3F4;
+      --ink-64: rgba(242, 243, 244, .64);
+      --ink-44: rgba(242, 243, 244, .44);
+      --hairline: rgba(242, 243, 244, .10);
+      --bg: #0E0F10;
+      --surface: #161819;
+      --inverted: #F2F3F4;
+      --inverted-ink: #0E0F10;
+      --status-green: #3ecb82;
+      --status-amber: #e0a030;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body { font-size: 15px; line-height: 28px; }
+
+  a { color: inherit; }
+
+  .shell {
+    max-width: var(--shell);
+    margin: 0 auto;
+    padding: 0 24px;
+  }
+
+  /* -------------------------------------------------- header -------- */
+
+  header.site {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: color-mix(in srgb, var(--bg) 85%, transparent);
+    -webkit-backdrop-filter: blur(8px);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--hairline);
+  }
+
+  header.site .shell {
+    height: 64px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .wordmark {
+    font-size: 14px;
+    font-weight: 600;
+  }
+
+  /* -------------------------------------------------- buttons -------- */
+
+  .btn {
+    appearance: none;
+    -webkit-appearance: none;
+    font-family: inherit;
+    font-size: 13px;
+    font-weight: 500;
+    height: 34px;
+    padding: 0 16px;
+    border-radius: var(--radius);
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    transition: opacity .12s ease;
+  }
+
+  .btn:hover { opacity: .85; }
+  .btn:disabled { opacity: .5; cursor: default; }
+
+  .btn-primary {
+    background: var(--inverted);
+    color: var(--inverted-ink);
+    border: 1px solid var(--inverted);
+  }
+
+  .btn-secondary {
+    background: var(--surface);
+    color: var(--ink);
+    border: 1px solid var(--hairline);
+  }
+
+  /* -------------------------------------------------- type ----------- */
+
+  .eyebrow {
+    font-size: 12px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    color: var(--ink-44);
+    margin: 0 0 16px;
+  }
+
+  h1 {
+    font-size: 30px;
+    font-weight: 600;
+    letter-spacing: -0.75px;
+    line-height: 1.2;
+    margin: 0 0 20px;
+  }
+
+  .lede {
+    font-size: 15px;
+    line-height: 28px;
+    color: var(--ink-64);
+    margin: 0;
+  }
+
+  .meta {
+    font-size: 12px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    color: var(--ink-44);
+  }
+
+  /* -------------------------------------------------- layout ---------- */
+
+  .hero {
+    padding: 96px 0 64px;
+    max-width: var(--measure);
+  }
+
+  .divider {
+    border: none;
+    border-top: 1px solid var(--hairline);
+    margin: 0;
+  }
+
+  section.drops {
+    padding: 64px 0 96px;
+  }
+
+  .drops-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 20px;
+    margin-top: 32px;
+  }
+
+  /* -------------------------------------------------- drop card -------- */
+
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    padding: 24px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .card-title {
+    font-size: 14px;
+    font-weight: 600;
+    margin: 0;
+  }
+
+  .card-desc {
+    font-size: 13px;
+    line-height: 22px;
+    color: var(--ink-64);
+    margin: 0;
+  }
+
+  .status-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex: none;
+    background: var(--status-green);
+  }
+
+  .status-dot.amber { background: var(--status-amber); }
+
+  .status-label {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--ink-64);
+  }
+
+  .fragility {
+    font-size: 12px;
+    color: var(--ink-44);
+    margin: -4px 0 0;
+  }
+
+  .channel-hint {
+    font-size: 12px;
+    line-height: 18px;
+    color: var(--ink-44);
+    margin: -2px 0 0;
+  }
+
+  .demo-note {
+    grid-column: 1 / -1;
+    font-size: 12px;
+    color: var(--ink-44);
+    margin: 0 0 8px;
+  }
+
+  .card-actions { margin-top: 4px; }
+
+  /* -------------------------------------------------- watch form -------- */
+
+  .watch-form {
+    display: none;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 4px;
+    padding-top: 16px;
+    border-top: 1px solid var(--hairline);
+  }
+
+  .watch-form.open { display: flex; }
+
+  .field-row {
+    display: flex;
+    gap: 8px;
+  }
+
+  select, input[type="text"] {
+    font-family: inherit;
+    font-size: 13px;
+    height: 34px;
+    padding: 0 10px;
+    border-radius: var(--radius);
+    border: 1px solid var(--hairline);
+    background: var(--bg);
+    color: var(--ink);
+    flex: 1;
+    min-width: 0;
+  }
+
+  select:focus, input[type="text"]:focus {
+    outline: none;
+    border-color: var(--ink-44);
+  }
+
+  .inline-msg {
+    font-size: 13px;
+    margin: 0;
+  }
+
+  .inline-msg.error { color: var(--status-amber); }
+  .inline-msg.success { color: var(--status-green); }
+  .inline-msg.neutral { color: var(--ink-64); }
+
+  .step { display: none; flex-direction: column; gap: 10px; }
+  .step.active { display: flex; }
+
+  .unsub-link {
+    font-size: 13px;
+    text-decoration: underline;
+    color: var(--ink-64);
+    cursor: pointer;
+    width: fit-content;
+  }
+
+  /* -------------------------------------------------- footer -------- */
+
+  footer.site {
+    padding: 32px 0 64px;
+  }
+
+  footer.site p {
+    font-size: 12px;
+    color: var(--ink-44);
+    margin: 0;
+  }
+
+  @media (max-width: 560px) {
+    .hero { padding: 64px 0 48px; }
+    section.drops { padding: 48px 0 64px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="site">
+  <div class="shell">
+    <div class="wordmark">Dropwatch</div>
+    <button class="btn btn-primary" id="header-cta" type="button">Watch a drop</button>
+  </div>
+</header>
+
+<main>
+  <div class="shell">
+    <section class="hero">
+      <p class="eyebrow">Early access</p>
+      <h1>Know the moment it drops.</h1>
+      <p class="lede">
+        An alert is a head start, not a guarantee &mdash; everyone watching
+        races for the same inventory. Dropwatch just makes sure you're
+        watching too.
+      </p>
+    </section>
+  </div>
+
+  <hr class="divider">
+
+  <div class="shell">
+    <section class="drops" id="drops">
+      <p class="meta">Currently tracked</p>
+      <div class="drops-grid" id="drops-grid">
+        <p class="lede" id="drops-loading">Loading drops&hellip;</p>
+      </div>
+    </section>
+  </div>
+</main>
+
+<footer class="site">
+  <div class="shell">
+    <p>Dropwatch is an early-access alerting tool. It does not purchase, reserve, or hold anything on your behalf. <a href="/how">How it works</a></p>
+  </div>
+</footer>
+
+<template id="card-template">
+  <article class="card" data-drop-id="">
+    <p class="card-title"></p>
+    <p class="card-desc"></p>
+    <div class="status-row">
+      <span class="status-dot"></span>
+      <span class="status-label"></span>
+    </div>
+    <p class="fragility" hidden></p>
+    <div class="card-actions">
+      <button class="btn btn-secondary watch-toggle" type="button">Watch this drop</button>
+    </div>
+
+    <div class="watch-form">
+      <div class="step step-subscribe active">
+        <div class="field-row">
+          <select class="channel-select">
+            <option value="discord">Discord</option>
+            <option value="ntfy">ntfy</option>
+            <option value="webhook">Webhook</option>
+            <!-- Telegram stays disabled until the bot-handshake flow
+                 exists: a bot cannot message a bare @username, so the
+                 sign-up literally cannot complete. Offering it anyway
+                 is how the first real subscriber hit a dead end. -->
+            <option value="telegram" disabled>Telegram (coming soon)</option>
+          </select>
+        </div>
+        <input type="text" class="address-input" placeholder="https://discord.com/api/webhooks/…">
+        <p class="channel-hint" hidden>Alerts arrive as signed JSON &mdash;
+          see <a href="/how#automating">How it works</a>.</p>
+        <button class="btn btn-primary subscribe-submit" type="button">Subscribe</button>
+        <p class="inline-msg" data-slot="subscribe"></p>
+      </div>
+
+      <div class="step step-verify">
+        <p class="inline-msg neutral">Enter the 6-digit code delivered to this channel.</p>
+        <div class="field-row">
+          <input type="text" class="code-input" placeholder="6-digit code">
+          <button class="btn btn-primary verify-submit" type="button">Verify</button>
+        </div>
+        <p class="inline-msg" data-slot="verify"></p>
+      </div>
+
+      <div class="step step-success">
+        <p class="inline-msg success">You're watching this drop.</p>
+        <a class="unsub-link" data-role="unsubscribe">Unsubscribe</a>
+        <p class="inline-msg" data-slot="unsub"></p>
+      </div>
+    </div>
+  </article>
+</template>
+
+<script>
+(function () {
+  "use strict";
+
+  var ADDRESS_PLACEHOLDERS = {
+    telegram: "@your_telegram_handle",
+    discord: "https://discord.com/api/webhooks/…",
+    ntfy: "your-ntfy-topic",
+    webhook: "https://your-endpoint.example/dropwatch"
+  };
+
+  function el(sel, root) { return (root || document).querySelector(sel); }
+
+  function renderHealth(card, health) {
+    var dot = el(".status-dot", card);
+    var label = el(".status-label", card);
+    var fragility = el(".fragility", card);
+
+    if (health.state === "amber") {
+      dot.classList.add("amber");
+      label.textContent = "Fragile source";
+    } else {
+      dot.classList.remove("amber");
+      label.textContent = "Healthy";
+    }
+
+    if (health.detail) {
+      fragility.textContent = health.detail;
+      fragility.hidden = false;
+    } else {
+      fragility.hidden = true;
+    }
+  }
+
+  function buildCard(drop) {
+    var tpl = document.getElementById("card-template");
+    var node = tpl.content.cloneNode(true);
+    var card = node.querySelector(".card");
+
+    card.dataset.dropId = drop.id;
+    el(".card-title", card).textContent = drop.title;
+    el(".card-desc", card).textContent = drop.description || "";
+    renderHealth(card, drop.health);
+
+    var toggle = el(".watch-toggle", card);
+    var form = el(".watch-form", card);
+    var channelSelect = el(".channel-select", card);
+    var addressInput = el(".address-input", card);
+    var channelHint = el(".channel-hint", card);
+    var subscribeBtn = el(".subscribe-submit", card);
+    var subscribeMsg = el('[data-slot="subscribe"]', card);
+    var verifyBtn = el(".verify-submit", card);
+    var codeInput = el(".code-input", card);
+    var verifyMsg = el('[data-slot="verify"]', card);
+    var unsubLink = el('[data-role="unsubscribe"]', card);
+    var unsubMsg = el('[data-slot="unsub"]', card);
+
+    var stepSubscribe = el(".step-subscribe", card);
+    var stepVerify = el(".step-verify", card);
+    var stepSuccess = el(".step-success", card);
+
+    var subscriptionId = null;
+    var unsubToken = null;
+
+    function showStep(step) {
+      [stepSubscribe, stepVerify, stepSuccess].forEach(function (s) {
+        s.classList.toggle("active", s === step);
+      });
+    }
+
+    function setMsg(node, text, kind) {
+      node.textContent = text || "";
+      node.classList.remove("error", "success", "neutral");
+      if (kind) node.classList.add(kind);
+    }
+
+    function updateChannelUI() {
+      addressInput.placeholder = ADDRESS_PLACEHOLDERS[channelSelect.value] || "";
+      if (channelHint) channelHint.hidden = channelSelect.value !== "webhook";
+    }
+    updateChannelUI();
+    channelSelect.addEventListener("change", updateChannelUI);
+
+    toggle.addEventListener("click", function () {
+      var open = form.classList.toggle("open");
+      toggle.textContent = open ? "Close" : "Watch this drop";
+      if (open) {
+        // The expansion grows the card below the fold on short viewports;
+        // keep the whole form reachable without a manual scroll.
+        card.scrollIntoView({ block: "nearest", behavior: "smooth" });
+      }
+    });
+
+    subscribeBtn.addEventListener("click", function () {
+      var address = addressInput.value.trim();
+      if (!address) {
+        setMsg(subscribeMsg, "Enter an address for this channel.", "error");
+        return;
+      }
+      subscribeBtn.disabled = true;
+      setMsg(subscribeMsg, "", null);
+
+      fetch("/api/subscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          drop_id: drop.id,
+          channel: channelSelect.value,
+          address: address
+        })
+      })
+        .then(function (res) {
+          return res.json().then(function (body) {
+            return { ok: res.ok, body: body };
+          });
+        })
+        .then(function (result) {
+          subscribeBtn.disabled = false;
+          if (!result.ok) {
+            setMsg(subscribeMsg, result.body.error || "Could not subscribe.", "error");
+            return;
+          }
+          subscriptionId = result.body.subscription_id;
+          setMsg(subscribeMsg, "", null);
+          showStep(stepVerify);
+        })
+        .catch(function () {
+          subscribeBtn.disabled = false;
+          setMsg(subscribeMsg, "Network error. Try again.", "error");
+        });
+    });
+
+    verifyBtn.addEventListener("click", function () {
+      var code = codeInput.value.trim();
+      if (!code) {
+        setMsg(verifyMsg, "Enter the code.", "error");
+        return;
+      }
+      verifyBtn.disabled = true;
+      setMsg(verifyMsg, "", null);
+
+      fetch("/api/verify", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ subscription_id: subscriptionId, code: code })
+      })
+        .then(function (res) {
+          return res.json().then(function (body) {
+            return { ok: res.ok, body: body };
+          });
+        })
+        .then(function (result) {
+          verifyBtn.disabled = false;
+          if (!result.ok) {
+            setMsg(verifyMsg, result.body.error || "Incorrect code.", "error");
+            return;
+          }
+          unsubToken = result.body.unsubscribe_token;
+          showStep(stepSuccess);
+        })
+        .catch(function () {
+          verifyBtn.disabled = false;
+          setMsg(verifyMsg, "Network error. Try again.", "error");
+        });
+    });
+
+    unsubLink.addEventListener("click", function (ev) {
+      ev.preventDefault();
+      if (!unsubToken) return;
+
+      fetch("/api/unsubscribe", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ token: unsubToken })
+      })
+        .then(function () {
+          setMsg(unsubMsg, "You've been unsubscribed.", "neutral");
+          unsubLink.style.display = "none";
+        })
+        .catch(function () {
+          setMsg(unsubMsg, "Network error. Try again.", "error");
+        });
+    });
+
+    return card;
+  }
+
+  function loadDrops() {
+    var grid = document.getElementById("drops-grid");
+    fetch("/api/drops")
+      .then(function (res) { return res.json(); })
+      .then(function (body) {
+        grid.innerHTML = "";
+        if (body.demo) {
+          var note = document.createElement("p");
+          note.className = "demo-note";
+          note.textContent = "Demo environment — verification codes are " +
+            "printed to the server console, not sent to your device.";
+          grid.appendChild(note);
+        }
+        var drops = body.drops || [];
+        if (drops.length === 0) {
+          var p = document.createElement("p");
+          p.className = "lede";
+          p.textContent = "No drops are being tracked right now.";
+          grid.appendChild(p);
+          return;
+        }
+        drops.forEach(function (drop) {
+          grid.appendChild(buildCard(drop));
+        });
+      })
+      .catch(function () {
+        grid.innerHTML = "";
+        var p = document.createElement("p");
+        p.className = "inline-msg error";
+        p.textContent = "Could not load drops.";
+        grid.appendChild(p);
+      });
+  }
+
+  document.getElementById("header-cta").addEventListener("click", function () {
+    document.getElementById("drops").scrollIntoView({ behavior: "smooth" });
+  });
+
+  loadDrops();
+})();
+</script>
+
+</body>
+</html>

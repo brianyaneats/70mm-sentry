@@ -344,13 +344,13 @@ class TestNotifier(SentryTest):
         sentry.CFG["channels"]["ntfy"]["enabled"] = False
         sentry.CFG["channels"]["telegram"]["enabled"] = True
         sentry.CFG["channels"]["telegram"]["extra_chat_ids"] = \
-            ["@odyssey70mm", "-100555"]
+            ["@testchannel", "-100555"]
         seen = []
 
         def fake_urlopen(req, timeout=None):
             body = json.loads(req.data.decode())
             seen.append(body["chat_id"])
-            if body["chat_id"] == "@odyssey70mm":
+            if body["chat_id"] == "@testchannel":
                 return FakeResp(b'{"ok": false}')  # one subscriber feed down
             return FakeResp(b'{"ok": true}')
 
@@ -359,7 +359,7 @@ class TestNotifier(SentryTest):
             self.assertTrue(sentry.push("DROP", "b", priority="urgent",
                                         audience="all"))
         # primary first, then every extra despite the middle one failing
-        self.assertEqual(seen, ["424242", "@odyssey70mm", "-100555"])
+        self.assertEqual(seen, ["424242", "@testchannel", "-100555"])
 
     def test_telegram_primary_failure_still_fails_channel(self):
         sentry.CFG["channels"]["whatsapp"]["enabled"] = False

@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dropwatch-demo",
+      "runtimeExecutable": "python3",
+      "runtimeArgs": ["-m", "platformd.api", "--demo"],
+      "port": 8787
+    }
+  ]
+}

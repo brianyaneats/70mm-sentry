@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How it works — Dropwatch</title>
+<style>
+  :root {
+    --ink: #131517;
+    --ink-64: rgba(19, 21, 23, .64);
+    --ink-44: rgba(19, 21, 23, .44);
+    --hairline: rgba(19, 21, 23, .08);
+    --bg: #F7F8F9;
+    --surface: #FFFFFF;
+    --inverted: #131517;
+    --inverted-ink: #F7F8F9;
+    --radius: 8px;
+    --measure: 448px;
+    --shell: 1120px;
+    --status-green: #1a8754;
+    --status-amber: #b45309;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink: #F2F3F4;
+      --ink-64: rgba(242, 243, 244, .64);
+      --ink-44: rgba(242, 243, 244, .44);
+      --hairline: rgba(242, 243, 244, .10);
+      --bg: #0E0F10;
+      --surface: #161819;
+      --inverted: #F2F3F4;
+      --inverted-ink: #0E0F10;
+      --status-green: #3ecb82;
+      --status-amber: #e0a030;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body { font-size: 15px; line-height: 28px; }
+
+  a { color: inherit; }
+
+  .shell {
+    max-width: var(--shell);
+    margin: 0 auto;
+    padding: 0 24px;
+  }
+
+  /* -------------------------------------------------- header -------- */
+
+  header.site {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: color-mix(in srgb, var(--bg) 85%, transparent);
+    -webkit-backdrop-filter: blur(8px);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--hairline);
+  }
+
+  header.site .shell {
+    height: 64px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .wordmark {
+    font-size: 14px;
+    font-weight: 600;
+    text-decoration: none;
+  }
+
+  /* -------------------------------------------------- type ----------- */
+
+  .eyebrow {
+    font-size: 12px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    color: var(--ink-44);
+    margin: 0 0 16px;
+  }
+
+  h1 {
+    font-size: 30px;
+    font-weight: 600;
+    letter-spacing: -0.75px;
+    line-height: 1.2;
+    margin: 0 0 20px;
+    max-width: var(--measure);
+  }
+
+  .lede {
+    font-size: 15px;
+    line-height: 28px;
+    color: var(--ink-64);
+    margin: 0;
+    max-width: var(--measure);
+  }
+
+  .divider {
+    border: none;
+    border-top: 1px solid var(--hairline);
+    margin: 0;
+  }
+
+  /* -------------------------------------------------- document ------- */
+
+  .doc {
+    max-width: var(--measure);
+    padding: 96px 0 96px;
+  }
+
+  .doc-hero { margin-bottom: 64px; }
+
+  .doc-section { margin: 0 0 64px; }
+  .doc-section:last-child { margin-bottom: 0; }
+
+  .doc-section h2 {
+    font-size: 16px;
+    font-weight: 600;
+    line-height: 1.4;
+    margin: 0 0 16px;
+  }
+
+  .doc-section p {
+    margin: 0 0 16px;
+    color: var(--ink);
+  }
+
+  .doc-section p:last-child { margin-bottom: 0; }
+
+  .doc-section p.muted { color: var(--ink-64); }
+
+  .doc-section ol,
+  .doc-section ul {
+    margin: 0 0 16px;
+    padding-left: 20px;
+  }
+
+  .doc-section ol:last-child,
+  .doc-section ul:last-child { margin-bottom: 0; }
+
+  .doc-section li { margin: 0 0 6px; }
+  .doc-section li:last-child { margin-bottom: 0; }
+
+  .doc-section h3 {
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    color: var(--ink-64);
+    margin: 28px 0 10px;
+  }
+
+  .doc-section h3:first-of-type { margin-top: 0; }
+
+  /* -------------------------------------------------- status badge --- */
+
+  .badge-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 16px 0;
+    padding: 10px 12px;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    background: var(--surface);
+    max-width: fit-content;
+  }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex: none;
+    background: var(--status-green);
+  }
+
+  .status-dot.amber { background: var(--status-amber); }
+
+  .badge-row span.label {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--ink-64);
+  }
+
+  /* -------------------------------------------------- footer -------- */
+
+  footer.site {
+    padding: 32px 0 64px;
+    border-top: 1px solid var(--hairline);
+  }
+
+  footer.site p {
+    font-size: 12px;
+    color: var(--ink-44);
+    margin: 0;
+  }
+
+  @media (max-width: 560px) {
+    .doc { padding: 64px 0 64px; }
+    .doc-hero { margin-bottom: 48px; }
+    .doc-section { margin-bottom: 48px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="site">
+  <div class="shell">
+    <a class="wordmark" href="/">Dropwatch</a>
+  </div>
+</header>
+
+<main>
+  <div class="shell">
+    <div class="doc">
+
+      <section class="doc-hero">
+        <p class="eyebrow">How it works</p>
+        <h1>What Dropwatch does, and what it doesn't</h1>
+        <p class="lede">
+          This page explains, plainly, what happens between a drop opening
+          and an alert reaching you &mdash; and where our responsibility
+          ends and yours begins.
+        </p>
+      </section>
+
+      <section class="doc-section" id="what-this-is">
+        <h2>What this is</h2>
+        <p>
+          Dropwatch watches scarce-inventory drops &mdash; a campsite
+          reservation freed up by someone else's cancellation, a movie
+          finally going on sale &mdash; and alerts you the moment something
+          opens.
+        </p>
+        <p>
+          An alert from us is a head start, not a guarantee. Everyone else
+          watching that same drop is racing for the same inventory, and
+          getting our alert doesn't put you first in line. It just means
+          you're not finding out an hour late.
+        </p>
+        <p class="muted">
+          Dropwatch never buys, reserves, or holds anything on your behalf.
+          We tell you; what you do with that is entirely up to you.
+        </p>
+      </section>
+
+      <section class="doc-section" id="how-the-watching-works">
+        <h2>How the watching works</h2>
+        <p>
+          Each drop is checked on its own clock. In steady state, that
+          might mean once a minute. Inside a window where we know
+          something is likely to happen &mdash; a scheduled release time,
+          a pattern we've seen before &mdash; the checks tighten up to
+          every few seconds.
+        </p>
+        <p>
+          Those checks are deliberately paced to stay well inside what
+          each source can comfortably handle. We'd rather be a few seconds
+          slower than be the reason a source gets locked down for
+          everyone. One check covers every subscriber watching that drop
+          &mdash; ten people watching or ten thousand, the source sees the
+          same, single check either way.
+        </p>
+      </section>
+
+      <section class="doc-section" id="what-we-promise">
+        <h2>What we promise (and measure)</h2>
+        <p>
+          We're early &mdash; these are targets, not a track record yet.
+          Once we have production history, these numbers will be verified
+          continuously against it. Until then, the figures below come from
+          pre-production load tests on developer hardware, not live
+          traffic.
+        </p>
+        <ul>
+          <li>
+            A notification is dispatched within 60 seconds of detection.
+            During early access everyone is on the free tier &mdash;
+            there is nothing to buy yet. The paid tier, when it exists,
+            will get alerts immediately while free stays up to 60 seconds
+            behind, by design.
+          </li>
+          <li>
+            In testing, our internal delivery pipeline handled 10,000
+            notifications with zero lost.
+          </li>
+          <li>
+            If nobody receives an alert within 5 minutes of an event we
+            detected, that pages a human. Silence is treated as an
+            outage, not as luck.
+          </li>
+          <li>
+            Every alert either confirms it was delivered or retries.
+            Nothing is fire-and-forget.
+          </li>
+        </ul>
+        <p>
+          What we don't promise: that you'll win the inventory &mdash;
+          that's between you and everyone else watching &mdash; or that
+          an unofficial data source stays available. Some sources aren't
+          official APIs; they can change or go dark without notice. When
+          that risk applies to a drop, we say so on the card itself, not
+          in fine print:
+        </p>
+        <div class="badge-row">
+          <span class="status-dot amber"></span>
+          <span class="label">Fragile source</span>
+        </div>
+        <p>
+          We never sell a paid plan on one of those drops. If we can't
+          promise a source will still be there next month, we shouldn't
+          be taking your money for it &mdash; so the code refuses that
+          combination outright, rather than leaving it to our judgment.
+        </p>
+      </section>
+
+      <section class="doc-section" id="how-vetted">
+        <h2>How each drop is vetted</h2>
+        <p>
+          Every drop is sourced from official or public data only. If
+          watching something would require defeating a bot wall or
+          logging into someone's private account, we refuse it at
+          intake &mdash; permanently, not as a "maybe later."
+        </p>
+        <p>
+          Before anyone can subscribe, every new drop runs for a period
+          in shadow mode: we watch the real source ourselves, with no
+          subscribers attached, to make sure it behaves the way we expect
+          before we ask anyone to trust it.
+        </p>
+      </section>
+
+      <section class="doc-section" id="subscribing">
+        <h2>Subscribing</h2>
+        <p>Three steps, whichever channel you pick.</p>
+
+        <h3>Discord</h3>
+        <ol>
+          <li>Create a webhook for the channel you want alerts in.</li>
+          <li>Paste that webhook URL into Dropwatch.</li>
+          <li>You're subscribed. Alerts post straight to that channel.</li>
+        </ol>
+
+        <h3>ntfy</h3>
+        <ol>
+          <li>Pick a topic name in the ntfy phone app.</li>
+          <li>Enter that same topic in Dropwatch.</li>
+          <li>You're subscribed. Alerts arrive as phone notifications.</li>
+        </ol>
+
+        <h3>Your own webhook</h3>
+        <ol>
+          <li>Enter a URL you control.</li>
+          <li>Read the confirmation code we deliver to it.</li>
+          <li>You're subscribed. See
+            <a href="#automating">Automating on your side</a>.</li>
+        </ol>
+
+        <p class="muted">
+          Telegram is on the way. We're finishing the setup step that lets
+          the bot message you safely, and we'd rather ship it late than
+          offer a sign-up that can't finish.
+        </p>
+
+        <p class="muted">
+          SMS isn't offered yet. Carrier compliance for text messaging
+          takes real time to do right, and we'd rather wait than cut
+          corners on it.
+        </p>
+      </section>
+
+      <section class="doc-section" id="automating">
+        <h2>Automating on your side</h2>
+        <p>
+          Every alert can also be delivered as a signed, machine-readable
+          event to a URL you control &mdash; a webhook. That lets your own
+          scripts, running on your own machines with your own accounts,
+          react the instant a drop opens.
+        </p>
+        <p class="muted">
+          We never ask for or store your credentials for any booking
+          site. Dropwatch's job is telling you fast; what happens after
+          that is yours by design.
+        </p>
+        <p class="muted">
+          Automate responsibly. Some venues prohibit automated purchasing,
+          and we will never help you circumvent that.
+        </p>
+      </section>
+
+    </div>
+  </div>
+</main>
+
+<footer class="site">
+  <div class="shell">
+    <p>Dropwatch is an early-access alerting tool. It does not purchase, reserve, or hold anything on your behalf.</p>
+  </div>
+</footer>
+
+</body>
+</html>

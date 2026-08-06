@@ -14,3 +14,8 @@ snapshots/
 history.jsonl
 history.jsonl.1
 report.html
+# plan-comments editor sidecars — local review metadata, never part of the repo
+*.comments.json
+# an unrelated personal VS Code extension that happens to live here; not part
+# of this project and must never be published as if it were
+tools/

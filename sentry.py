@@ -6,7 +6,7 @@ site 403s scripted requests). Steady state costs 1 request per venue per run:
 probe the first date past the known schedule horizon. On a hit, a bounded
 sweep enumerates the new dates and a push goes out via ntfy.
 
-Design doc: https://claude.ai/code/artifact/e5799536-012f-494f-83bd-5f90044c32b5
+Design notes and enumerated weak points: docs/architecture-notes.md
 Env flags: SENTRY_NOW=1 skips start jitter and the overnight cadence gate.
 """
 
@@ -25,6 +25,8 @@ import urllib.parse
 import urllib.request
 import zoneinfo
 
+import adapters.fandango as fandango_adapter
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 # SENTRY_DATA lets the container keep config/state/logs on a mounted volume
 # while the code stays read-only in the image
@@ -33,9 +35,10 @@ CONFIG_PATH = os.path.join(DATA, "config.json")
 STATE_PATH = os.path.join(DATA, "state.json")
 LOG_PATH = os.path.join(DATA, "sentry.log")
 
-UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
-NAPI = "https://www.fandango.com/napi/theaterMovieShowtimes/{venue}?date={date}"
+# Sourced from the adapter — kept as module-level aliases here since
+# nothing outside sentry.py has ever needed to know the source moved.
+UA = fandango_adapter.UA
+NAPI = fandango_adapter.NAPI
 
 def apply_env(cfg):
     """Env wins over config.json. On a shared VPS this keeps the bot token
@@ -339,8 +342,17 @@ class RealtimeSession:
                 if resp.status >= 400:
                     raise RuntimeError(f"HTTP {resp.status}")
                 return resp.status, body
-            except Exception:
+            except Exception as e:
                 self.conn = None
+                # BrokenPipeError/ConnectionResetError/a dead kept-alive
+                # socket are expected events on a reused connection, not
+                # anomalies — but they must stay visible in the log even
+                # when the retry below papers over them transparently.
+                if isinstance(e, OSError):
+                    log(f"[PIPE] fandango realtime session {venue} "
+                        f"(errno={e.errno}, {type(e).__name__}): {e}"
+                        + (" — retrying on a fresh connection"
+                           if attempt == 1 else " — giving up"))
                 if attempt == 2:
                     raise
         raise RuntimeError("unreachable")
@@ -354,11 +366,18 @@ class RealtimeSession:
             self.conn = None
 
 
+def fandango_target(venue):
+    """Opaque adapter target for one venue — the bits the Fandango adapter
+    needs to build a URL/headers/observations, sourced from CFG so the
+    adapter itself never has to read config.json."""
+    return {"venue": venue, "referer": CFG["venues"][venue]["referer"],
+            "movie_match": CFG["movie_match"],
+            "movie_exclude": CFG.get("movie_exclude", []),
+            "format_match": CFG["format_match"]}
+
+
 def napi_headers(venue):
-    return {"User-Agent": UA,
-            "Referer": CFG["venues"][venue]["referer"],
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "en-US,en;q=0.9"}
+    return fandango_adapter.build_headers(fandango_target(venue))
 
 
 _LAST_REQUEST_AT = 0.0
@@ -384,6 +403,29 @@ def pace_request():
     if wait > 0:
         time.sleep(wait)
     _LAST_REQUEST_AT = time.time()
+
+
+_HTTP_CODE_RE = re.compile(r"\b([45]\d{2})\b")
+
+
+def classify_fetch_error(e):
+    """Best-effort grep-able tag for a fetch failure's log line.
+
+    Never used for control flow — the caller has already decided this is
+    a failure; this only decides how loudly and under which stable tag to
+    say so. Order matters: a shape/JSON failure is checked first (most
+    specific), then a message that names an HTTP status (a RuntimeError
+    from RealtimeSession, or an HTTPError whose str() includes the code),
+    then any OSError — which is exactly the broken-pipe/reset/dead-socket
+    family the [PIPE] tag exists for."""
+    if isinstance(e, (fandango_adapter.FandangoFeedShapeError,
+                      json.JSONDecodeError)):
+        return "PARSE"
+    if _HTTP_CODE_RE.search(str(e)):
+        return "REFUSED"
+    if isinstance(e, OSError):
+        return "PIPE"
+    return "FETCH"
 
 
 def budget_gate(st):
@@ -413,18 +455,30 @@ def fetch_day(st, venue, date, session=None):
         return BUDGET
     pace_request()
     budget_spend(st)
+    target = fandango_target(venue)
     try:
         if session is not None:
             status, body = session.get(venue, date)
         else:
-            url = NAPI.format(venue=venue, date=date)
-            req = urllib.request.Request(url, headers=napi_headers(venue))
+            url = fandango_adapter.build_url(target, date)
+            headers = fandango_adapter.build_headers(target)
+            req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=25) as r:
                 body = r.read()
                 status = getattr(r, "status", None)
         payload = json.loads(body)
-        vm = payload["viewModel"]
-    except KeyError:
+        vm = fandango_adapter.extract_viewmodel(payload)
+    except Exception as e:
+        tag = classify_fetch_error(e)
+        errno_part = (f", errno={e.errno}"
+                     if isinstance(e, OSError) and e.errno is not None else "")
+        st["lastFetch"] = {"at": dt.datetime.now().isoformat(), "ok": False,
+                           "venue": venue, "date": date, "error": str(e)[:200]}
+        log(f"[{tag}] fandango fetch failed {venue} {date} "
+            f"({type(e).__name__}{errno_part}): {e}")
+        return None
+
+    if vm is None:
         # a day whose showtimes have all passed answers {"date": null} with no
         # viewModel at all. That is a valid "nothing listed", not a failure:
         # counting it would trip the breaker every night once the study poll
@@ -435,11 +489,6 @@ def fetch_day(st, venue, date, session=None):
                            "bytes": len(body), "movies": 0, "hits": 0,
                            "note": "no listings for this date"}
         return {}
-    except Exception as e:
-        st["lastFetch"] = {"at": dt.datetime.now().isoformat(), "ok": False,
-                           "venue": venue, "date": date, "error": str(e)[:200]}
-        log(f"fetch failed {venue} {date}: {e}")
-        return None
 
     movies = vm.get("movies") or []
     hits = odyssey_70mm(vm)
@@ -455,7 +504,7 @@ def fetch_day(st, venue, date, session=None):
         st["blindAlerted"] = False  # re-arm: blindness can recur
     else:
         st["blindStreak"] = st.get("blindStreak", 0) + 1
-        log(f"SUSPECT {venue} {date}: HTTP {status}, {len(body)}B, "
+        log(f"[BLIND] fandango {venue} {date}: HTTP {status}, {len(body)}B, "
             f"0 movies (streak {st['blindStreak']})")
         maybe_blind_alert(st)
     if CFG.get("capture_last_response"):
@@ -790,30 +839,15 @@ def heartbeat(st=None):
 # ---------- detection ----------
 
 def odyssey_70mm(vm):
-    """Return list of non-past 70mm showtimes for the target movie."""
-    hits = []
-    for m in vm.get("movies", []):
-        title = (m.get("title") or "").lower()
-        if CFG["movie_match"] not in title:
-            continue
-        # "odyssey" alone would also match a "2001: A Space Odyssey" 70mm
-        # revival — a real Lincoln Square occurrence — and a false drop
-        # would advance the horizon past real dates
-        if any(x in title for x in CFG.get("movie_exclude", [])):
-            continue
-        for v in m.get("variants", []):
-            for g in v.get("amenityGroups", []):
-                for s in g.get("showtimes", []):
-                    fmts = [f.get("filterName", "")
-                            for f in s.get("filmFormat", [])]
-                    if not any(CFG["format_match"] in x.upper() for x in fmts):
-                        continue
-                    if s.get("type") == "pastshowtime" or s.get("expired"):
-                        continue
-                    hits.append({"time": s.get("date"),
-                                 "type": s.get("type"), "formats": fmts,
-                                 "url": s.get("ticketingJumpPageURL")})
-    return hits
+    """Return list of non-past 70mm showtimes for the target movie.
+
+    Delegates the actual title/format matching to the Fandango adapter
+    (adapters/fandango.py) so the kernel and the adapter share exactly one
+    implementation — this wrapper exists only so every existing caller and
+    test keeps calling `sentry.odyssey_70mm(vm)` unchanged."""
+    return fandango_adapter.match_showtimes(
+        vm, CFG["movie_match"], CFG.get("movie_exclude", []),
+        CFG["format_match"])
 
 
 def scan_dates(st, venue, dates):
@@ -1618,7 +1652,10 @@ def status():
           f"after {CFG.get('target_after_hour')}:00")
     print(f"alerted:      {st.get('targetAlerted') or '(none)'}")
     print(f"restock watch:{restock_watchlist(st) or ' (none)'}")
-    print(f"healthchecks: {CFG.get('healthchecks_url') or '(NOT SET)'}")
+    # Masked: the URL is a bearer credential, and --status output is the thing
+    # the README tells you to paste when asking for help.
+    _hc = CFG.get("healthchecks_url")
+    print(f"healthchecks: {'configured (…' + _hc[-4:] + ')' if _hc else '(NOT SET)'}")
     hb = st.get("lastHeartbeat")
     hb_age = "never" if not hb else f"last hb {int(time.time() - hb)}s ago"
     print(f"deadman:      "

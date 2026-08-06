@@ -5,7 +5,34 @@ at the AMC venues in `config → venues` and pushes to your iPhone. No third-par
 trackers, no Claude dependency — one Python file (stdlib only), a config, and a
 timer: launchd on a Mac, or the Docker entrypoint on a VPS.
 
-Design doc (weak points W1–W6 enumerated): https://claude.ai/code/artifact/e5799536-012f-494f-83bd-5f90044c32b5
+## What's built
+
+Every number below is current as of this clone — run the commands yourself to
+check them.
+
+- **One file, zero dependencies.** `sentry.py` is 1,673 lines of stdlib-only
+  Python — no `pip install`, no `requirements.txt`, nothing to audit in a
+  supply chain. `import`s are `datetime`, `fcntl`, `http.client`, `json`,
+  `os`, `random`, `re`, `socket`, `sys`, `time`, `urllib`, `zoneinfo` — that's
+  the whole list. The same file runs under launchd on a Mac or the Docker
+  entrypoint on a VPS unmodified.
+- **280 unit tests, all green, all network mocked**
+  (`python3 -m unittest discover -s tests`) — 233 in `tests/test_sentry.py`,
+  28 in `tests/test_report.py`, 19 in `tests/test_watchdog.py`. The test
+  suite (2,941 lines across those three files) is larger than the code it
+  tests.
+- **Three notification channels, wired and covered by test**: Telegram
+  (recommended primary), WhatsApp (CallMeBot relay or Meta's Cloud API), and
+  ntfy — an alert counts as delivered the moment any one of them gets
+  through, not only the first.
+- **An off-box dead-man's switch that actually runs**:
+  [`.github/workflows/deadman.yml`](.github/workflows/deadman.yml), an hourly
+  GitHub Actions cron, Telegrams you if the on-box heartbeat goes stale. It's
+  the one failure mode — the machine itself being asleep, off, or
+  unreachable — that no on-box layer (the watchdog, the startup check) can
+  ever report on its own, because they die with the machine too.
+
+Weak points W1–W6 are enumerated in [docs/architecture-notes.md](docs/architecture-notes.md).
 
 ## Quickstart (Mac, ~5 minutes)
 
@@ -94,7 +121,11 @@ secrets to arm the off-box dead-man (see Observability).
   afternoons and this Mac is on Pacific.
 - **Politeness:** hard daily request budget (enforced in code), start jitter,
   circuit breaker on failures
-  (3 strikes → open 30 min, exponential to 4 h cap, one degraded alert at 6).
+  (3 strikes → open 60 s, doubling per further failure to a 4 h cap, one
+  degraded alert at 6). The 60 s floor is deliberately short — it used to be
+  a flat 30 min, until three read timeouts on 2026-07-29 tripped it over a
+  network blip minutes before a target date listed, and the watchdog
+  correctly reported the sentry blind for the whole half hour.
 - **W5 guard:** weekly low-priority "Sentry alive" push proves the whole channel.
 
 ## Who hears what
@@ -218,8 +249,8 @@ TELEGRAM_TOKEN=<botfather-token>
 TELEGRAM_CHAT_ID=<your-chat-id>
 TELEGRAM_EXTRA_CHAT_IDS=<subscriber-channel-id>
 HEALTHCHECKS_URL=https://hc-ping.com/<uuid>
-TARGET_DATES=2026-08-21,2026-08-22,2026-08-26
-INSTANCE_NAME=vps-nyc3
+TARGET_DATES=<yyyy-mm-dd>,<yyyy-mm-dd>
+INSTANCE_NAME=<instance-label>
 EOF
 chmod 600 .env
 ```
@@ -385,19 +416,21 @@ To go WhatsApp-only, set `channels.ntfy.enabled: false`.
 cd ~/Developer/70mm-sentry && python3 -m unittest discover -s tests -v
 ```
 
-123 unit tests, all network mocked: 70mm detection (incl. soldout/restricted
-typing), drop handling (horizon advances only on delivered alerts; failed
-push retries), sweep cutoff, budget rollover/exhaustion, breaker
-open/half-open/recover + degraded alert dedup-with-retry, notifier fan-out
-(one channel failing doesn't lose the alert) incl. best-effort channel
-broadcast, CallMeBot URL + Meta template payloads, the Referer header on
-every fetch, cadence tiers + burst windows, target-date watch and evening
-slot filtering, response telemetry + blind-streak alerting, instance-name
-stamping (ops titles only, never ticket alerts), preflight verdicts
-(refusal, blind payload, zero hits, budget projection), watchdog liveness
-(staleness, dedup, re-nag, recovery, error capture), and the read-only
-`--check` probe. Live layer checks: `--test-push` plus polling the ntfy
-topic JSON to confirm receipt.
+280 unit tests, all network mocked, split across three files: 233 in
+`test_sentry.py` (70mm detection incl. soldout/restricted typing, drop
+handling — horizon advances only on delivered alerts, failed push retries —
+sweep cutoff, budget rollover/exhaustion, breaker open/half-open/recover +
+degraded alert dedup-with-retry, notifier fan-out — one channel failing
+doesn't lose the alert — incl. best-effort channel broadcast, CallMeBot URL +
+Meta template payloads, the Referer header on every fetch, cadence tiers +
+burst windows, target-date watch and evening slot filtering, response
+telemetry + blind-streak alerting, instance-name stamping — ops titles only,
+never ticket alerts — and preflight verdicts: refusal, blind payload, zero
+hits, budget projection); 19 in `test_watchdog.py` (staleness, dedup,
+re-nag, recovery, error capture, and the read-only `--check` probe); 28 in
+`test_report.py` (the availability-replay analytics side-car). Live layer
+checks, not run by the suite: `--test-push` plus polling the ntfy topic JSON
+to confirm receipt.
 
 A fresh clone needs `cp config.example.json config.json` first —
 `sentry.py` reads it at import time.
@@ -495,14 +528,15 @@ deadman — generate a long random topic, it is a credential), and
 
 ## Known limits (accepted trade-offs)
 
-- **Mac asleep = no polling** (launchd catches up on wake). Residential IP
-  reputation beats datacenter for this endpoint (W3), so the Docker/VPS path
-  trades reachability for uptime — `preflight.py` is the gate that decides
-  whether a given box gets to make that trade at all.
+- **Mac asleep = no polling** (W2) — launchd catches up on wake, but there's a
+  real dead window while the lid is closed. Residential IP reputation beats
+  datacenter for this endpoint (W3), so the Docker/VPS path trades
+  reachability for uptime — `preflight.py` is the gate that decides whether a
+  given box gets to make that trade at all.
 - **Fandango's lag behind AMC's own listings is still unmeasured** (W1) — on the
   next real drop, compare the alert timestamp against when AMC first showed the
   dates; if the gap is bad, the design doc has the fallback path.
-- Detection latency: ~1 min daytime (base cadence), ≤60 min overnight.
+- **Detection latency: ~1 min daytime (base cadence), ≤60 min overnight** (W6).
   `dropLog` accumulates real drop timestamps; once two exist, add matching
   `burst_windows` to config for 20 s polling in those windows. Research note:
   AMC does not announce batch-drop timing and no community-verified schedule
