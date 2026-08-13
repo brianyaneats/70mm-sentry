@@ -1,26 +1,102 @@
 # 70mm Sentry
 
-Self-owned watcher that detects newly released **The Odyssey IMAX 70mm** showtimes
-at the AMC venues in `config → venues` and pushes to your iPhone. No third-party
-trackers, no Claude dependency — one Python file (stdlib only), a config, and a
-timer: launchd on a Mac, or the Docker entrypoint on a VPS.
+**Tickets for a limited 70mm run go on sale without warning and sell out in
+minutes. This tells you the moment it happens.**
+
+A self-owned watcher that detects newly released **The Odyssey IMAX 70mm**
+showtimes at AMC and pushes to your phone in seconds. No third-party trackers,
+no accounts, no dependencies — one stdlib-only Python file, a config, and a
+timer: launchd on a Mac, or Docker on a VPS.
+
+![tests](https://img.shields.io/badge/tests-584%20passing-brightgreen)
+![deps](https://img.shields.io/badge/dependencies-0-blue)
+![python](https://img.shields.io/badge/python-3.9%2B%20stdlib-blue)
+![license](https://img.shields.io/badge/license-MIT-lightgrey)
+
+## Who this is for
+
+- **You want a specific hard-to-get thing** — a 70mm screening, a campsite, a
+  restock — and the seller announces nothing. Point it at your dates, get a
+  message the instant they list.
+- **You're building an unattended watcher of your own** and want a worked
+  example of the unglamorous parts: politeness limits that can't be bypassed,
+  delivery-gated state, and four separate alarms for the ways a poller goes
+  silently blind. The [architecture](docs/ARCHITECTURE.md) and
+  [lessons](docs/LESSONS.md) docs are written for you.
+- **You're evaluating whether to build or buy** an alerting tool. This is the
+  honest cost of "just poll a website every 30 seconds," fully itemized.
+
+Not for you if you want automated *buying*. This tool ends at telling a human
+to go get a ticket — see [what's deliberately not built](docs/ARCHITECTURE.md#8-what-is-deliberately-not-built).
+
+## Why this exists
+
+Nolan's *The Odyssey* played 70mm at exactly two AMC theaters. AMC extends the
+schedule in batches, announces nothing, and the good showtimes are gone within
+minutes of listing. Refreshing a page forever is not a plan, and the community
+tracker everyone points to is a single point of failure operated by a stranger.
+
+The first constraint discovered was the whole design problem: **there is no
+API.** AMC's own site `403`s every scripted request. Fandango's internal
+endpoint answers — but only with the right header, and its `robots.txt`
+disallows the path. So the real question was never "consume a feed," it was:
+
+> *How do you poll a source that never agreed to be polled — politely enough to
+> keep being served, fast enough to still get a ticket, and reliably enough that
+> you'd bet a sold-out screening on it while you're asleep?*
+
+Everything in this repo is an answer to some part of that sentence.
+
+## Architecture at a glance
+
+```mermaid
+flowchart LR
+    T["⏱ timer<br/>every 10s"] --> L{"🔒 lock<br/>+ cadence gate"}
+    L --> G["governor<br/>budget · 1 req/s · breaker"]
+    G --> F["Fandango adapter<br/>kept-alive TLS in<br/>drop windows"]
+    F --> D["detector<br/>70mm + availability"]
+    D --> E["engine<br/>probe · targets<br/>sniper · reconcile"]
+    E --> N["notifier"]
+    N --> P["📱 Telegram / ntfy<br/>WhatsApp"]
+    N -->|"only if delivered"| S[("state.json")]
+    S -.-> E
+    E -.->|"heartbeat"| O["☁️ off-box deadman<br/>GitHub Actions"]
+```
+
+Four detectors share one request budget: an O(1) **horizon probe** that makes
+"nothing happened" nearly free, a **target watch** for dates you name, a
+**refund sniper** for returned seats, and a daily **reconcile** as the safety
+net. State advances *only* after a push is confirmed delivered, so a channel
+outage retries instead of silently eating the one alert that mattered.
+
+📐 **[Full architecture with diagrams →](docs/ARCHITECTURE.md)**
+🧠 **[Design rationale, decision by decision →](docs/architecture-notes.md)**
+💡 **[Things I learned building it →](docs/LESSONS.md)**
 
 ## What's built
 
 Every number below is current as of this clone — run the commands yourself to
 check them.
 
-- **One file, zero dependencies.** `sentry.py` is 1,673 lines of stdlib-only
+- **One file, zero dependencies.** `sentry.py` is 1,707 lines of stdlib-only
   Python — no `pip install`, no `requirements.txt`, nothing to audit in a
   supply chain. `import`s are `datetime`, `fcntl`, `http.client`, `json`,
   `os`, `random`, `re`, `socket`, `sys`, `time`, `urllib`, `zoneinfo` — that's
   the whole list. The same file runs under launchd on a Mac or the Docker
   entrypoint on a VPS unmodified.
-- **280 unit tests, all green, all network mocked**
+- **584 unit tests, all green, all network mocked**
   (`python3 -m unittest discover -s tests`) — 233 in `tests/test_sentry.py`,
-  28 in `tests/test_report.py`, 19 in `tests/test_watchdog.py`. The test
-  suite (2,941 lines across those three files) is larger than the code it
-  tests.
+  19 in `test_watchdog.py`, 28 in `test_report.py`, 22 in
+  `test_fandango_adapter.py`, 30 in `test_recreation_gov.py`, and 197 across
+  the six `test_platform_*.py` files. The suite (6,605 lines across 12 files)
+  is nearly four times the size of the watcher it tests.
+- **A second source already ported.** `adapters/recreation_gov.py` proves the
+  shape generalizes beyond movies — the same engine watches campsite
+  availability.
+- **A multi-tenant service layer.** `platformd/` (API, subscriber channels,
+  delivery outbox, governor, webhooks) with a small web UI called
+  **Dropwatch** — try it with `python3 -m platformd.api --demo` and open
+  `127.0.0.1:8787`. Plan of record: [docs/platform/](docs/platform/README.md).
 - **Three notification channels, wired and covered by test**: Telegram
   (recommended primary), WhatsApp (CallMeBot relay or Meta's Cloud API), and
   ntfy — an alert counts as delivered the moment any one of them gets
@@ -416,7 +492,7 @@ To go WhatsApp-only, set `channels.ntfy.enabled: false`.
 cd ~/Developer/70mm-sentry && python3 -m unittest discover -s tests -v
 ```
 
-280 unit tests, all network mocked, split across three files: 233 in
+584 unit tests, all network mocked. The watcher's own coverage: 233 in
 `test_sentry.py` (70mm detection incl. soldout/restricted typing, drop
 handling — horizon advances only on delivered alerts, failed push retries —
 sweep cutoff, budget rollover/exhaustion, breaker open/half-open/recover +
@@ -428,9 +504,12 @@ telemetry + blind-streak alerting, instance-name stamping — ops titles only,
 never ticket alerts — and preflight verdicts: refusal, blind payload, zero
 hits, budget projection); 19 in `test_watchdog.py` (staleness, dedup,
 re-nag, recovery, error capture, and the read-only `--check` probe); 28 in
-`test_report.py` (the availability-replay analytics side-car). Live layer
-checks, not run by the suite: `--test-push` plus polling the ntfy topic JSON
-to confirm receipt.
+`test_report.py` (the availability-replay analytics side-car). The remaining
+271 cover the source adapters (`test_fandango_adapter.py`,
+`test_recreation_gov.py`) and the platform layer (`test_platform_*.py`:
+API, channels, core, governor, outbox, runner, webhook). Live layer checks,
+not run by the suite: `--test-push` plus polling the ntfy topic JSON to
+confirm receipt.
 
 A fresh clone needs `cp config.example.json config.json` first —
 `sentry.py` reads it at import time.
