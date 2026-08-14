@@ -1,36 +1,26 @@
 # Architecture
 
-Diagrams and the reasoning path that produced them. The deep rationale for each
-decision — with the alternatives that were rejected and why — lives in
-[architecture-notes.md](architecture-notes.md). This file is the map; that one
-is the argument.
+Diagrams of how the pieces fit. The discoveries that drove these choices are in
+the [README](../README.md); the decision-by-decision rationale, including
+options I rejected, is in [architecture-notes.md](architecture-notes.md).
+
+Three things about the problem set everything else:
+
+- **Latency is the metric.** Showtimes sell out in minutes, so seconds matter.
+- **It runs unattended.** It has to survive reboots, sleep, crashes and network
+  blips — and be able to tell me it's still alive.
+- **A missed alert is a total loss.** No partial credit, so each way it can fail
+  silently needs its own alarm.
+
+And the constraint I hit on day one: there's no API. AMC 403s scripted
+requests, and Fandango's `napi` endpoint only answers with a venue `Referer`
+header (its `robots.txt` disallows `/napi/`). So this isn't "consume a feed,"
+it's "poll something that never agreed to be polled, politely enough to keep
+being served."
 
 ---
 
-## 1. The problem, stated precisely
-
-> A limited-run film plays 70mm at two theaters. AMC adds new dates to the
-> schedule without announcing when. The good showtimes sell out in minutes.
-> Tell me the moment a date appears, on my phone, without me watching a page.
-
-Three properties fall out of that sentence, and they drive everything below:
-
-| Requirement | Consequence |
-|---|---|
-| "the moment" | Detection latency is the primary metric. Seconds, not hours. |
-| "without me watching" | It must survive reboots, sleep, crashes, and network blips **unattended** — and prove it is still alive. |
-| "sells out in minutes" | A missed alert is a total loss. There is no partial credit, so every failure mode needs its own alarm. |
-
-The hard constraint discovered on day one: **there is no API.** AMC's own site
-returns `403` to any scripted request. What exists is Fandango's internal
-`napi` endpoint, which answers plain HTTP — but only with a venue `Referer`
-header, and its `robots.txt` disallows `/napi/`. So the design problem is not
-"consume a feed"; it is *"poll a source that never agreed to be polled, politely
-enough to keep being served, fast enough to matter."*
-
----
-
-## 2. System at a glance
+## 1. System at a glance
 
 ```mermaid
 flowchart TD
@@ -88,7 +78,7 @@ blips; send-then-record retries. Every ledger write in the diagram sits
 
 ---
 
-## 3. Detection: four strategies, one budget
+## 2. Detection: four strategies, one budget
 
 A single "check for new stuff" loop cannot cover the ways a ticket becomes
 available. Four narrow detectors share one request budget instead.
@@ -134,7 +124,7 @@ Why four and not one:
 
 ---
 
-## 4. Observability: a quiet log looks exactly like a healthy one
+## 3. Observability: four alarms, because a quiet log looks healthy
 
 The failure that matters most is not a crash — it is a watcher that keeps
 running while silently seeing nothing. Four distinct silent failures, four
@@ -175,7 +165,7 @@ The distinction between the alarms is deliberate:
 
 ---
 
-## 5. Why polling — and how to make polling feel like streaming
+## 4. Why polling, and how to make it faster
 
 This was tested, not assumed. Fandango exposes **no websocket, no SSE**, and it
 **ignores `If-None-Match`** (verified 2026-07-27: an ETag comes back, but a
@@ -210,7 +200,7 @@ process can hold the lock or hang unnoticed.
 
 ---
 
-## 6. Why a timer + lock instead of a daemon
+## 5. Why a timer + lock instead of a daemon
 
 ```mermaid
 flowchart TD
@@ -238,7 +228,7 @@ costs detection latency.
 
 ---
 
-## 7. How it grew
+## 6. How it grew
 
 The architecture was not designed up front; each layer exists because something
 specific broke. That history is the most useful part of this repo:
@@ -272,7 +262,7 @@ is [docs/platform/README.md](platform/README.md).
 
 ---
 
-## 8. What is deliberately *not* built
+## 7. What it deliberately does not do
 
 The boundary is as designed as the features:
 

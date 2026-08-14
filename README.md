@@ -1,102 +1,153 @@
 # 70mm Sentry
 
-**Tickets for a limited 70mm run go on sale without warning and sell out in
-minutes. This tells you the moment it happens.**
+Watches AMC for new *Odyssey* IMAX 70mm showtimes and messages me on Telegram
+when dates go on sale or when sold-out seats come back. Stdlib-only Python on a
+timer — launchd on my Mac, Docker on a VPS.
 
-A self-owned watcher that detects newly released **The Odyssey IMAX 70mm**
-showtimes at AMC and pushes to your phone in seconds. No third-party trackers,
-no accounts, no dependencies — one stdlib-only Python file, a config, and a
-timer: launchd on a Mac, or Docker on a VPS.
+I built it because the good showtimes sell out in minutes, AMC doesn't announce
+when new dates get added, and the tracker everyone links to is one guy's
+website. I wanted something I owned.
 
-![tests](https://img.shields.io/badge/tests-584%20passing-brightgreen)
-![deps](https://img.shields.io/badge/dependencies-0-blue)
-![python](https://img.shields.io/badge/python-3.9%2B%20stdlib-blue)
-![license](https://img.shields.io/badge/license-MIT-lightgrey)
+These are my notes from building it. If you're writing something similar,
+sections 1 and 2 will save you the most time.
 
-## Who this is for
+## 1. What I figured out about the data
 
-- **You want a specific hard-to-get thing** — a 70mm screening, a campsite, a
-  restock — and the seller announces nothing. Point it at your dates, get a
-  message the instant they list.
-- **You're building an unattended watcher of your own** and want a worked
-  example of the unglamorous parts: politeness limits that can't be bypassed,
-  delivery-gated state, and four separate alarms for the ways a poller goes
-  silently blind. The [architecture](docs/ARCHITECTURE.md) and
-  [lessons](docs/LESSONS.md) docs are written for you.
-- **You're evaluating whether to build or buy** an alerting tool. This is the
-  honest cost of "just poll a website every 30 seconds," fully itemized.
+**AMC's own site is a dead end.** Every scripted request gets a 403. Don't
+spend time here.
 
-Not for you if you want automated *buying*. This tool ends at telling a human
-to go get a ticket — see [what's deliberately not built](docs/ARCHITECTURE.md#8-what-is-deliberately-not-built).
+**Fandango's internal endpoint works — but only with a Referer header.**
+`fandango.com/napi/theaterMovieShowtimes/{theaterId}?date=YYYY-MM-DD` returns
+clean JSON to plain curl. Without a Referer you get a 403 saying "Session
+expired or invalid token," which reads exactly like rate limiting. It isn't. I
+nearly built a whole backoff strategy around a missing header. Test one
+variable at a time before you design around a failure.
 
-## Why this exists
+**The obvious field is the wrong one.** Every showtime has `filmFormatHeader`,
+and it says "Premium Format" for everything — useless. The real signal is
+`filmFormat[].filterName`, which is where `IMAX 70MM` actually lives. Had I
+shipped against the obvious field, it would have matched nothing and reported
+"no drops" forever. That's the worst kind of bug: it looks like good news.
 
-Nolan's *The Odyssey* played 70mm at exactly two AMC theaters. AMC extends the
-schedule in batches, announces nothing, and the good showtimes are gone within
-minutes of listing. Refreshing a page forever is not a plan, and the community
-tracker everyone points to is a single point of failure operated by a stranger.
+**"Listed" is not "buyable."** AMC posts showtimes that are already sold out.
+So the alert I actually wanted was never "a new date appeared" — it's "you can
+buy a seat right now." Those are two different events, sometimes days apart.
+The `type` field carries it: `available`, `soldout`, `restricted`,
+`pastshowtime`.
 
-The first constraint discovered was the whole design problem: **there is no
-API.** AMC's own site `403`s every scripted request. Fandango's internal
-endpoint answers — but only with the right header, and its `robots.txt`
-disallows the path. So the real question was never "consume a feed," it was:
+**Drops aren't contiguous.** On July 29, Aug 25 and Aug 26 went on sale while
+Aug 20–24 stayed empty. My cheap "just check the day after the last known date"
+probe saw nothing at all. I now also poll an explicit list of dates I care
+about, plus a daily 21-day sweep as a backstop.
 
-> *How do you poll a source that never agreed to be polled — politely enough to
-> keep being served, fast enough to still get a ticket, and reliably enough that
-> you'd bet a sold-out screening on it while you're asleep?*
+**Polling is the only option, and I checked properly.** No websocket, no SSE,
+and `If-None-Match` is ignored — you get an ETag back, but a conditional GET
+still returns the full body. So the only two levers are asking more often
+during the hours that matter, and not paying for a TLS handshake every time
+(54ms → 21ms per request on a kept-alive connection).
 
-Everything in this repo is an answer to some part of that sentence.
+## 2. What didn't work
 
-## Architecture at a glance
+**Writing state before confirming the message sent.** I marked a date
+"announced," then pushed the alert. One channel blip and that alert was gone
+forever — every later cycle saw the date as old news. Now nothing is recorded
+until a push actually delivers, so a failure just retries.
+
+**A rolling "scan everything I haven't announced yet" walk.** Looked like an
+obvious upgrade over the horizon probe. It fired a false ticket alert into the
+channel my friends are in, within two minutes. The bug: my "announced" list
+only knows what *this script* announced, so every date that was already on sale
+before I wrote the thing looked like breaking news. Reverted the same night.
+
+**A 30-minute circuit breaker backoff.** Three read timeouts — an ordinary
+network blip — tripped it minutes before one of my target dates listed, and I
+was blind for the full half hour. It starts at 60s now and doubles from there.
+
+**Hardcoding the Python path in the launchd plists.** An Xcode install
+invalidated `/usr/bin/python3` and killed the watcher *and* its watchdog at the
+same moment, because both pointed at the same interpreter. They each try a list
+now.
+
+**iMessage.** Messages.app refuses to send to your own account, and
+self-messages don't fire a notification on the phone anyway. Dead end — I
+looked into a second Apple ID and it wasn't worth it.
+
+**Permanently muting a showtime after one restock alert.** Reasonable-sounding
+anti-spam, except each target date has exactly one 70mm screening. Sleep
+through that single alert and you'd never be told again. It's a 30-minute
+cooldown now.
+
+**CallMeBot for WhatsApp.** It works, but it's a hobbyist relay with no SLA
+that sees your message text. Telegram's bot API is first-party, free, and lets
+me send low-priority stuff silently. That's what I use.
+
+**Depending on drop70mm.com.** That was version one. Someone else's uptime,
+someone else's rate limiting, no control.
+
+## 3. The part I underestimated
+
+Knowing it still works. A watcher that dies quietly is worse than no watcher,
+because you're counting on it — and a quiet log looks exactly like a healthy
+one.
+
+Four checks, because each is blind to something the others catch:
+
+- `watchdog.py`, every 5 min — is the process actually running?
+- **blind streak** — requests succeed but the payload has 0 movies, 20 times
+  running. Something changed upstream.
+- **parser check** — the daily sweep knows the film is playing, so 0 hits
+  across 21 days means my matching broke, not that the world went quiet.
+- **GitHub Actions cron** — the only check not on my Mac. If the laptop is
+  asleep, nothing local can tell me, so the sentry publishes a heartbeat to a
+  secret ntfy topic and an hourly Action yells if it goes stale.
+
+Closing the laptop is still the real gap. Everything else has an alarm on it.
+
+## 4. How it fits together
 
 ```mermaid
 flowchart LR
-    T["⏱ timer<br/>every 10s"] --> L{"🔒 lock<br/>+ cadence gate"}
+    T["timer<br/>every 10s"] --> L{"lock<br/>+ cadence gate"}
     L --> G["governor<br/>budget · 1 req/s · breaker"]
     G --> F["Fandango adapter<br/>kept-alive TLS in<br/>drop windows"]
     F --> D["detector<br/>70mm + availability"]
     D --> E["engine<br/>probe · targets<br/>sniper · reconcile"]
     E --> N["notifier"]
-    N --> P["📱 Telegram / ntfy<br/>WhatsApp"]
+    N --> P["Telegram / ntfy<br/>WhatsApp"]
     N -->|"only if delivered"| S[("state.json")]
     S -.-> E
-    E -.->|"heartbeat"| O["☁️ off-box deadman<br/>GitHub Actions"]
+    E -.->|"heartbeat"| O["off-box deadman<br/>GitHub Actions"]
 ```
 
-Four detectors share one request budget: an O(1) **horizon probe** that makes
-"nothing happened" nearly free, a **target watch** for dates you name, a
-**refund sniper** for returned seats, and a daily **reconcile** as the safety
-net. State advances *only* after a push is confirmed delivered, so a channel
-outage retries instead of silently eating the one alert that mattered.
+Four detectors share one request budget. The horizon probe costs one request
+per venue and answers "is there anything past the last date I know about" — it
+makes "nothing happened" nearly free, which is what pays for everything else.
+The target watch brute-forces dates I named. The refund sniper re-checks
+sold-out shows for returned seats. The daily reconcile catches what the probe's
+contiguity assumption misses.
 
-📐 **[Full architecture with diagrams →](docs/ARCHITECTURE.md)**
-🧠 **[Design rationale, decision by decision →](docs/architecture-notes.md)**
-💡 **[Things I learned building it →](docs/LESSONS.md)**
+More detail: [architecture with diagrams](docs/ARCHITECTURE.md) ·
+[decision-by-decision rationale](docs/architecture-notes.md) ·
+[longer lessons writeup](docs/LESSONS.md)
 
-## What's built
+It does not buy tickets. No checkout automation, no CAPTCHA solving, no queue
+bypass, no seat-map scraping, and it never logs in anywhere. It tells me to go
+buy a ticket and that's where it stops.
 
-Every number below is current as of this clone — run the commands yourself to
-check them.
+## What's in here
 
-- **One file, zero dependencies.** `sentry.py` is 1,707 lines of stdlib-only
-  Python — no `pip install`, no `requirements.txt`, nothing to audit in a
-  supply chain. `import`s are `datetime`, `fcntl`, `http.client`, `json`,
-  `os`, `random`, `re`, `socket`, `sys`, `time`, `urllib`, `zoneinfo` — that's
-  the whole list. The same file runs under launchd on a Mac or the Docker
-  entrypoint on a VPS unmodified.
-- **584 unit tests, all green, all network mocked**
-  (`python3 -m unittest discover -s tests`) — 233 in `tests/test_sentry.py`,
-  19 in `test_watchdog.py`, 28 in `test_report.py`, 22 in
-  `test_fandango_adapter.py`, 30 in `test_recreation_gov.py`, and 197 across
-  the six `test_platform_*.py` files. The suite (6,605 lines across 12 files)
-  is nearly four times the size of the watcher it tests.
-- **A second source already ported.** `adapters/recreation_gov.py` proves the
-  shape generalizes beyond movies — the same engine watches campsite
-  availability.
-- **A multi-tenant service layer.** `platformd/` (API, subscriber channels,
-  delivery outbox, governor, webhooks) with a small web UI called
-  **Dropwatch** — try it with `python3 -m platformd.api --demo` and open
-  `127.0.0.1:8787`. Plan of record: [docs/platform/](docs/platform/README.md).
+- `sentry.py` — the watcher, 1,707 lines, stdlib only. Imports are `datetime`,
+  `fcntl`, `http.client`, `json`, `os`, `random`, `re`, `socket`, `sys`,
+  `time`, `urllib`, `zoneinfo`. No pip install, nothing to audit.
+- `tests/` — 584 tests, all network mocked
+  (`python3 -m unittest discover -s tests`). 233 cover the watcher itself. It's
+  a lot, but every branch matters at a moment I can't reproduce on demand.
+- `adapters/` — Fandango plus `recreation_gov.py`, which was mostly a check
+  that the same shape works for something other than movies. It does.
+- `platformd/` — a multi-tenant version (API, subscriber channels, delivery
+  outbox, webhooks) with a small web UI called Dropwatch. Try it:
+  `python3 -m platformd.api --demo`, then open `127.0.0.1:8787`. Plan of
+  record: [docs/platform/](docs/platform/README.md).
 - **Three notification channels, wired and covered by test**: Telegram
   (recommended primary), WhatsApp (CallMeBot relay or Meta's Cloud API), and
   ntfy — an alert counts as delivered the moment any one of them gets
