@@ -52,11 +52,13 @@ flowchart TD
     DETECT --> ENGINE
 
     subgraph ENGINE ["Decision engine — pure-ish, heavily tested"]
-        PROBE["Horizon probe<br/>is there a date past the edge?"]
+        PROBE["Horizon probe<br/>past the edge?"]
+        GAP["Gap scan<br/>skipped-over dates"]
         TARGET["Target watch<br/>named dates, own clock"]
         RESTOCK["Refund sniper<br/>soldout → available"]
         LEDGER[("Ledgers<br/>announced · everAvailable<br/>seenAvailability · horizon")]
         PROBE --- LEDGER
+        GAP --- LEDGER
         TARGET --- LEDGER
         RESTOCK --- LEDGER
     end
@@ -78,10 +80,10 @@ blips; send-then-record retries. Every ledger write in the diagram sits
 
 ---
 
-## 2. Detection: four strategies, one budget
+## 2. Detection: five strategies, one budget
 
 A single "check for new stuff" loop cannot cover the ways a ticket becomes
-available. Four narrow detectors share one request budget instead.
+available. Five narrow detectors share one request budget instead.
 
 ```mermaid
 flowchart LR
@@ -108,19 +110,41 @@ flowchart LR
     end
 ```
 
-Why four and not one:
+```mermaid
+flowchart LR
+    subgraph S5 ["⑤ Gap scan — the dates the probe can't see"]
+        E1["Round-robin the window<br/>2 dates / 10 min"] --> E2{"seen this date before?"}
+        E2 -->|"no"| E3["record baseline<br/>ALWAYS silent"]
+        E2 -->|"yes, was empty,<br/>now listed"| E4["🔔 skipped-the-queue alert"]
+        E2 -->|"yes, unchanged"| E5["done"]
+    end
+```
+
+Why five and not one:
 
 - The **probe** is O(1) — it makes "nothing happened" nearly free, which is what
   buys the budget for everything else. It answers one bit: *is there anything
   past the edge of the known schedule?*
-- The probe's blind spot is real and documented: it assumes AMC extends the run
+- The probe's blind spot is structural: it assumes AMC extends the run
   **contiguously**. On 2026-07-29 Aug 25 and Aug 26 went on sale while Aug 20–24
-  stayed empty. The probe saw nothing.
-- The **target watch** covers that by brute force for dates you actually care
-  about, and the **reconcile** bounds the miss for everything else at ~24h.
+  stayed empty, and the probe — which only ever looks at horizon+1 — saw nothing.
+- The **gap scan** closes that. The hard part isn't walking the window, it's not
+  crying wolf: the first attempt alerted on every date already on sale before
+  the watcher existed, because `announced` only records what *this* watcher
+  announced. The fix is a separate ledger, `state.observedDates`, in which the
+  first sighting of any (venue, date) is **always silent baseline**. Only a date
+  observed *without* qualifying showtimes that later gains them can ring.
+  Seeded against live data it baselined 33 on-sale dates and alerted zero times.
+- The **target watch** brute-forces dates you actually name, and the
+  **reconcile** is the backstop that bounds any remaining miss at ~24h.
 - The **sniper** exists because listing ≠ buyable. AMC posts showtimes that are
   already sold out, so "a date appeared" and "you can buy a seat" are different
   events needing different alerts.
+
+Two commands gate trusting the gap scan with the channel — `--seed-observed`
+baselines the window in one pass, and `--gap-dryrun` reports what it *would*
+ring for against real state and live data while pushing nothing and writing
+nothing.
 
 ---
 

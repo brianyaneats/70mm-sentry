@@ -158,6 +158,9 @@ def default_state():
         "histSeen": {},
         "histSeenAt": {},
         "studyLastPoll": {},
+        "observedDates": {},
+        "gapLastPoll": {},
+        "gapScanLastAt": None,
     }
 
 
@@ -1241,25 +1244,170 @@ def restock_check(st, venue, dates, now=None, session=None):
 REALTIME_SLICE = 240
 
 
-# KNOWN GAP, deliberately not yet automated — read before rebuilding it.
+# ---------- gap scan: the dates the horizon probe cannot see ----------
 #
-# The horizon probe only looks at horizon+1, which assumes AMC extends the run
-# contiguously. It does not: on 2026-07-29 Aug 25 AND Aug 26 went on sale
-# while Aug 20-24 stayed empty, so the probe saw nothing; only the explicit
-# target watch caught Aug 26, and Aug 25 waited for the daily reconcile.
+# The probe only looks at horizon+1, which assumes AMC extends the run
+# contiguously. It does not: on 2026-07-29 Aug 25 AND Aug 26 went on sale while
+# Aug 20-24 stayed empty, so the probe saw nothing; only the explicit target
+# watch caught Aug 26, and Aug 25 waited for the daily reconcile.
 #
 # A rolling "scan dates we have not announced" walk was tried and reverted the
 # same night, because it fired a false ticket alert to the live channel within
 # two minutes. The trap: `announced` records only dates this watcher alerted on
 # as NEW. It knows nothing about the schedule that was already on sale before
-# the watcher existed, so every pre-existing date looks like news. The horizon
-# is the only thing encoding "already known", and a horizon-independent walk
-# throws that away.
+# the watcher existed, so every pre-existing date looked like news.
 #
-# A correct version needs its own ledger of every (venue, date) ever OBSERVED
-# WITH LISTINGS — seeded by a full scan with alerting suppressed — and must be
-# dry-run against real state with channels disabled before it can push
-# anything. Until then the reconcile covers non-contiguous adds within a day.
+# What makes this version safe is a ledger of its own. `state.observedDates`
+# maps venue -> {date: bool listed}, and the FIRST sighting of any (venue,
+# date) is always silent baseline — never an alert, whatever it finds. Only a
+# date this watcher has already seen WITHOUT qualifying 70mm listings, which
+# later gains them, can ring. A fresh install is therefore quiet until it has
+# looked at the window once (`--seed-observed` does that in one pass), which is
+# exactly the behaviour whose absence caused the false alert.
+
+
+def gap_window(st, venue, now):
+    """Dates the gap scan is responsible for: today through the horizon plus a
+    margin. Starts at today because a skipped-over date can list at any time,
+    and runs past the horizon because that is where non-contiguous adds land."""
+    today = now.date()
+    horizon = dt.date.fromisoformat(st["horizon"][venue])
+    margin = CFG.get("gap_scan_days_past_horizon", 21)
+    end = max(horizon, today) + dt.timedelta(days=margin)
+    out, d = [], today
+    while d <= end:
+        out.append(d.isoformat())
+        d += dt.timedelta(days=1)
+    return out
+
+
+def gap_due_dates(st, venue, now, limit=None):
+    """Least-recently-scanned dates first; never-scanned before those. The
+    window is walked round-robin at a few dates per pass so full coverage
+    costs hours, not the reconcile's 24."""
+    if limit is None:
+        limit = CFG.get("gap_scan_per_cycle", 2)
+    poll = st.setdefault("gapLastPoll", {})
+    dates = gap_window(st, venue, now)
+    # "" sorts before any ISO timestamp, so unscanned dates go first
+    dates.sort(key=lambda d: poll.get(f"{venue}|{d}", ""))
+    return dates[:limit]
+
+
+def gap_alert(st, venue, date, hits):
+    """Ring for a date that skipped the queue. Same delivery-gated bookkeeping
+    as every other path: nothing is recorded unless a push actually landed."""
+    if not announce_ok(st, date):
+        return
+    vcfg = CFG["venues"][venue]
+    open_ = [h for h in hits if h["type"] == "available"]
+    gone = [h for h in hits if h["type"] != "available"]
+    if not open_ and not CFG.get("alert_on_soldout_listing", False):
+        # listed already sold out — the sniper owns the alert that matters
+        mark_announced(st, [date])
+        st["autoRestockDates"] = sorted(
+            set(st["autoRestockDates"]) | {date})
+        log(f"gap scan: {date} listed but every qualifying slot sold out — "
+            f"no alert; refund watch armed")
+        return
+    lines = [f"{pretty_date(date)} just listed at {vcfg['name']} "
+             f"({vcfg['tz_label']}). This one skipped the queue — earlier "
+             f"dates are still empty, so it would not have shown up as the "
+             f"next date in line.", ""]
+    for h in open_:
+        lines.append(f"🎟  {pretty_time(h['time'])} — tap to pick seats:\n"
+                     f"{h.get('url') or vcfg['link']}")
+    if gone:
+        lines.append("Already sold out: " +
+                     ", ".join(pretty_time(h["time"]) for h in gone))
+    lines += ["", "Tip: a showtime can be listed and still have no seats "
+              "left, so check the map before celebrating."]
+    if push(f"🎬 Odyssey 70mm — {pretty_date(date)} just listed",
+            "\n".join(lines), audience="all"):
+        mark_announced(st, [date])
+        if gone:
+            st["autoRestockDates"] = sorted(
+                set(st["autoRestockDates"]) | {date})
+        # keep the probe honest: without this it re-finds this date forever
+        if date > st["horizon"][venue]:
+            st["horizon"][venue] = date
+
+
+def gap_scan(st, now, session=None, dry=False, limit=None):
+    """One pass of the round-robin. Returns the list of dates that newly
+    gained listings (for tests and --gap-dryrun); alerts as a side effect
+    unless dry."""
+    found = []
+    if not CFG.get("gap_scan_enabled", True):
+        return found
+    for venue in CFG["venues"]:
+        observed = st.setdefault("observedDates", {}).setdefault(venue, {})
+        for date in gap_due_dates(st, venue, now, limit):
+            vm = fetch_day(st, venue, date, session=session)
+            if vm is BUDGET:
+                return found
+            if vm is None:
+                breaker_fail(st)
+                return found
+            breaker_success(st)
+            if not dry:
+                st["gapLastPoll"][f"{venue}|{date}"] = now.isoformat()
+            hits = [h for h in odyssey_70mm(vm) if slot_qualifies(h["time"])]
+            prev = observed.get(date)
+            if prev is None:  # first sighting: baseline, always silent
+                if not dry:
+                    observed[date] = bool(hits)
+                log(f"gap baseline {venue} {date}: "
+                    f"{'listed' if hits else 'empty'}")
+                continue
+            if hits and not prev:
+                found.append((venue, date, len(hits),
+                              sum(1 for h in hits
+                                  if h["type"] == "available")))
+                if dry:
+                    log(f"[DRY] would alert {venue} {date}: {len(hits)} slots")
+                    continue
+                observed[date] = True
+                gap_alert(st, venue, date, hits)
+            elif not dry:
+                observed[date] = bool(hits)
+    return found
+
+
+def gap_due(st, now):
+    last = st.get("gapScanLastAt")
+    return (not last or elapsed_seconds(now, last)
+            >= CFG.get("gap_scan_every_seconds", 600) * 0.9)
+
+
+def seed_observed():
+    """Populate the gap ledger in one pass, alerting nothing. Run once after
+    install (or after wiping state) so the scan starts from a known schedule
+    instead of learning it a couple of dates per pass."""
+    st = load_state()
+    now = dt.datetime.now().astimezone()
+    total = 0
+    for venue in CFG["venues"]:
+        observed = st.setdefault("observedDates", {}).setdefault(venue, {})
+        for date in gap_window(st, venue, now):
+            vm = fetch_day(st, venue, date)
+            if vm is BUDGET:
+                print("daily request budget reached; rerun tomorrow")
+                break
+            if vm is None:
+                print(f"fetch failed on {date}; stopping (state kept)")
+                break
+            hits = [h for h in odyssey_70mm(vm) if slot_qualifies(h["time"])]
+            observed[date] = bool(hits)
+            st.setdefault("gapLastPoll", {})[f"{venue}|{date}"] = \
+                now.isoformat()
+            total += 1
+            print(f"  {venue} {date}: {'listed' if hits else 'empty'}")
+            time.sleep(CFG.get("sweep_spacing_seconds", 4))
+    st["gapScanLastAt"] = now.isoformat()
+    save_state(st)
+    print(f"seeded {total} (venue, date) observations")
+    return 0
 
 
 def probe_once(st, venue, session=None, date=None):
@@ -1338,6 +1486,13 @@ def realtime_loop(st, now):
                 for d in due:
                     st["restockLastPoll"][d] = now.isoformat()
                 save_state(st)  # a delivered ring must survive a slice seam
+            # the gap scan rides in here too: a drop window is exactly when a
+            # date can skip the queue, and its own clock keeps the cost at a
+            # couple of requests per ten minutes
+            if gap_due(st, now):
+                st["gapScanLastAt"] = now.isoformat()
+                if gap_scan(st, now, session=session):
+                    save_state(st)
             heartbeat(st)                        # self-throttling
             polls += 1
             if dropped or polls % 5 == 0:
@@ -1587,6 +1742,12 @@ def main():
         st["everAvailable"] = sorted(
             k for k in st.get("everAvailable", [])
             if k.split("|")[1] >= today)
+        st["gapLastPoll"] = {
+            k: v for k, v in st.get("gapLastPoll", {}).items()
+            if k.split("|")[1] >= today}
+        st["observedDates"] = {
+            v: {d: seen for d, seen in dates.items() if d >= today}
+            for v, dates in st.get("observedDates", {}).items()}
         heartbeat(st)
         save_state(st)
         snapshot_state(st)
@@ -1605,6 +1766,13 @@ def main():
     # steady state: one probe per venue at horizon+1
     for venue in CFG["venues"]:
         probe_once(st, venue)
+
+    # gap scan: the non-contiguous dates the probe structurally cannot see.
+    # On its own slower clock so full window coverage costs hours, not the
+    # reconcile's 24 — and a couple of requests per pass, not a sweep.
+    if gap_due(st, now):
+        st["gapScanLastAt"] = now.isoformat()
+        gap_scan(st, now)
 
     # restock sniping: each watched date on its own clock — tight when the
     # show is imminent, relaxed otherwise
@@ -1698,6 +1866,21 @@ if __name__ == "__main__":
         sys.exit(startup_push())
     if "--digest-preview" in sys.argv:  # print only — never pushes
         print(build_digest(load_state()))
+        sys.exit(0)
+    if "--seed-observed" in sys.argv:   # fills the gap ledger, alerts nothing
+        sys.exit(seed_observed())
+    if "--gap-dryrun" in sys.argv:
+        # what WOULD the gap scan ring for, against real state and live data?
+        # Pushes nothing, writes nothing. The gate this feature has to pass
+        # before it is trusted with the channel again.
+        _st = load_state()
+        _now = dt.datetime.now().astimezone()
+        _n = 0
+        for _v in CFG["venues"]:
+            _n = max(_n, len(gap_window(_st, _v, _now)))
+        _hits = gap_scan(_st, _now, dry=True, limit=_n)
+        print(f"would alert on {len(_hits)} date(s): "
+              f"{[(v, d) for v, d, *_ in _hits] or 'none'}")
         sys.exit(0)
     if "--test-push" in sys.argv:
         ok = push("Sentry channel test",

@@ -1785,6 +1785,7 @@ class TestRealtimeLoop(SentryTest):
                                   return_value=9999), \
                 mock.patch.object(sentry, "target_check"), \
                 mock.patch.object(sentry, "restock_check"), \
+                mock.patch.object(sentry, "gap_scan", return_value=[]), \
                 mock.patch.object(sentry, "heartbeat"), \
                 mock.patch.object(sentry, "save_state"), \
                 mock.patch.object(sentry, "RealtimeSession"), \
@@ -1824,6 +1825,7 @@ class TestRealtimeLoop(SentryTest):
                                   return_value=9999), \
                 mock.patch.object(sentry, "target_check"), \
                 mock.patch.object(sentry, "restock_check"), \
+                mock.patch.object(sentry, "gap_scan", return_value=[]), \
                 mock.patch.object(sentry, "heartbeat"), \
                 mock.patch.object(sentry, "RealtimeSession"), \
                 mock.patch.object(sentry, "probe_once", return_value=True), \
@@ -1839,6 +1841,7 @@ class TestRealtimeLoop(SentryTest):
                                   return_value=9999), \
                 mock.patch.object(sentry, "target_check"), \
                 mock.patch.object(sentry, "restock_check"), \
+                mock.patch.object(sentry, "gap_scan", return_value=[]), \
                 mock.patch.object(sentry, "heartbeat"), \
                 mock.patch.object(sentry, "save_state"), \
                 mock.patch.object(sentry, "probe_once",
@@ -2507,3 +2510,159 @@ class TestFirstOnSaleCopy(SentryTest):
         finally:
             os.unlink(path)
         self.assertEqual(st["everAvailable"], [])
+
+
+class TestGapScan(SentryTest):
+    """The horizon probe only looks at horizon+1, so a non-contiguous drop
+    (Aug 25-26 listing while Aug 20-24 stayed empty, 2026-07-29) is invisible
+    to it. The gap scan covers that window — and the reason the FIRST attempt
+    at this had to be reverted the same night is pinned below: a date this
+    watcher has never looked at must never ring, because it cannot tell a new
+    listing from a schedule that was already on sale before it existed."""
+
+    def setUp(self):
+        super().setUp()
+        self.now = dt.datetime.now().astimezone()
+        self.st["horizon"]["AABQI"] = (self.now.date() +
+                                       dt.timedelta(days=3)).isoformat()
+
+    def run_scan(self, per_date, push_ok=True, dry=False, limit=None):
+        """per_date: {iso_date: [showtimes]}. Unlisted dates answer empty."""
+        def fake_fetch(st, venue, date, session=None):
+            return viewmodel(per_date.get(date, []))
+        with mock.patch.object(sentry, "fetch_day", side_effect=fake_fetch), \
+             mock.patch.object(sentry, "push", return_value=push_ok) as p:
+            found = sentry.gap_scan(self.st, self.now, dry=dry, limit=limit)
+        return found, p
+
+    # --- the safety property that cost a false alert to learn ---
+
+    def test_first_sighting_never_alerts_even_when_listed(self):
+        d = (self.now.date() + dt.timedelta(days=10)).isoformat()
+        found, p = self.run_scan({d: [showtime()]}, limit=30)
+        p.assert_not_called()
+        self.assertEqual(found, [])
+        self.assertTrue(self.st["observedDates"]["AABQI"][d])
+
+    def test_pre_existing_schedule_stays_silent_across_repeat_passes(self):
+        # a whole window already on sale before the watcher existed
+        listed = {(self.now.date() + dt.timedelta(days=i)).isoformat():
+                  [showtime()] for i in range(12)}
+        for _ in range(3):
+            _, p = self.run_scan(listed, limit=30)
+            p.assert_not_called()
+
+    # --- the case it exists to catch ---
+
+    def test_date_that_gains_listings_after_baseline_rings(self):
+        d = (self.now.date() + dt.timedelta(days=10)).isoformat()
+        self.run_scan({}, limit=30)                       # baseline: empty
+        self.assertFalse(self.st["observedDates"]["AABQI"][d])
+        found, p = self.run_scan({d: [showtime()]}, limit=30)
+        self.assertEqual([f[1] for f in found], [d])
+        p.assert_called_once()
+        self.assertIn("just listed", p.call_args.args[0])
+        self.assertIn("skipped the queue", p.call_args.args[1])
+
+    def test_non_contiguous_drop_the_probe_would_miss(self):
+        # exactly the 2026-07-29 shape: horizon+1..+5 empty, +6 and +7 listed
+        far = [(self.now.date() + dt.timedelta(days=9)).isoformat(),
+               (self.now.date() + dt.timedelta(days=10)).isoformat()]
+        self.run_scan({}, limit=40)
+        found, p = self.run_scan({d: [showtime()] for d in far}, limit=40)
+        self.assertEqual(sorted(f[1] for f in found), sorted(far))
+        self.assertEqual(p.call_count, 2)
+
+    # --- bookkeeping is delivery-gated like every other path ---
+
+    def test_failed_push_leaves_it_alertable_next_pass(self):
+        d = (self.now.date() + dt.timedelta(days=10)).isoformat()
+        self.run_scan({}, limit=30)
+        _, p = self.run_scan({d: [showtime()]}, push_ok=False, limit=30)
+        p.assert_called_once()
+        self.assertNotIn(d, self.st["announced"])
+        self.assertEqual(self.st["horizon"]["AABQI"],
+                         (self.now.date() + dt.timedelta(days=3)).isoformat())
+
+    def test_delivered_push_advances_horizon_and_announces(self):
+        d = (self.now.date() + dt.timedelta(days=10)).isoformat()
+        self.run_scan({}, limit=30)
+        self.run_scan({d: [showtime()]}, limit=30)
+        self.assertIn(d, self.st["announced"])
+        self.assertEqual(self.st["horizon"]["AABQI"], d)
+
+    def test_already_announced_date_does_not_double_ring(self):
+        d = (self.now.date() + dt.timedelta(days=10)).isoformat()
+        self.run_scan({}, limit=30)
+        sentry.mark_announced(self.st, [d])
+        _, p = self.run_scan({d: [showtime()]}, limit=30)
+        p.assert_not_called()
+
+    def test_listing_that_arrives_sold_out_arms_sniper_silently(self):
+        d = (self.now.date() + dt.timedelta(days=10)).isoformat()
+        self.run_scan({}, limit=30)
+        _, p = self.run_scan({d: [showtime(type_="soldout")]}, limit=30)
+        p.assert_not_called()
+        self.assertIn(d, self.st["autoRestockDates"])
+        self.assertIn(d, self.st["announced"])
+
+    # --- cost control ---
+
+    def test_round_robin_covers_the_window_without_repeating(self):
+        seen = []
+
+        def fake_fetch(st, venue, date, session=None):
+            seen.append(date)
+            return viewmodel([])
+        with mock.patch.object(sentry, "fetch_day", side_effect=fake_fetch), \
+             mock.patch.object(sentry, "push", return_value=True):
+            for _ in range(5):
+                sentry.gap_scan(self.st, self.now, limit=2)
+                self.now += dt.timedelta(seconds=601)
+        self.assertEqual(len(seen), 10)
+        self.assertEqual(len(set(seen)), 10)  # no date scanned twice
+
+    def test_disabled_by_config_does_nothing(self):
+        sentry.CFG["gap_scan_enabled"] = False
+        _, p = self.run_scan({}, limit=30)
+        p.assert_not_called()
+        self.assertEqual(self.st.get("observedDates"), {})
+
+    def test_own_clock_gates_the_scan(self):
+        self.assertTrue(sentry.gap_due(self.st, self.now))
+        self.st["gapScanLastAt"] = self.now.isoformat()
+        self.assertFalse(sentry.gap_due(self.st, self.now))
+        later = self.now + dt.timedelta(seconds=601)
+        self.assertTrue(sentry.gap_due(self.st, later))
+
+    def test_budget_and_failure_stop_the_pass_without_tripping_twice(self):
+        with mock.patch.object(sentry, "fetch_day",
+                               return_value=sentry.BUDGET), \
+             mock.patch.object(sentry, "push", return_value=True) as p:
+            self.assertEqual(sentry.gap_scan(self.st, self.now), [])
+        p.assert_not_called()
+        self.assertEqual(self.st["breaker"]["failures"], 0)  # not our fault
+        with mock.patch.object(sentry, "fetch_day", return_value=None):
+            sentry.gap_scan(self.st, self.now)
+        self.assertEqual(self.st["breaker"]["failures"], 1)
+
+    # --- the dry run that gates trusting it with the channel ---
+
+    def test_dry_run_reports_without_pushing_or_writing(self):
+        d = (self.now.date() + dt.timedelta(days=10)).isoformat()
+        self.run_scan({}, limit=30)
+        before = json.dumps(self.st, sort_keys=True)
+        found, p = self.run_scan({d: [showtime()]}, dry=True, limit=30)
+        p.assert_not_called()
+        self.assertEqual([f[1] for f in found], [d])
+        self.assertEqual(json.dumps(self.st, sort_keys=True), before)
+
+    # --- slot filtering matches every other path ---
+
+    def test_slots_below_target_hour_are_ignored(self):
+        sentry.CFG["target_dates"] = ["2099-01-01"]  # enables slot filtering
+        sentry.CFG["target_after_hour"] = 18
+        d = (self.now.date() + dt.timedelta(days=10)).isoformat()
+        self.run_scan({}, limit=30)
+        _, p = self.run_scan({d: [showtime(time_="10:00a")]}, limit=30)
+        p.assert_not_called()

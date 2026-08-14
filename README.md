@@ -37,8 +37,27 @@ The `type` field carries it: `available`, `soldout`, `restricted`,
 
 **Drops aren't contiguous.** On July 29, Aug 25 and Aug 26 went on sale while
 Aug 20–24 stayed empty. My cheap "just check the day after the last known date"
-probe saw nothing at all. I now also poll an explicit list of dates I care
-about, plus a daily 21-day sweep as a backstop.
+probe saw nothing at all — it structurally can't, because it only ever looks at
+one date.
+
+Fixing that properly took two attempts. The first one scanned every date I
+hadn't announced yet, and fired a false ticket alert into the channel my
+friends are in within two minutes: my "announced" list only knows what *this
+script* announced, so the entire schedule that was already on sale before I
+wrote it looked like breaking news. Reverted the same night.
+
+The version that works keeps its own ledger (`state.observedDates`) and treats
+the **first sighting of any date as silent baseline, always** — whatever it
+finds. Only a date I've already seen *without* 70mm showtimes, which later
+gains them, can ring. Seeding it against live data baselined 33 already-on-sale
+dates and sent zero alerts, which is the whole point. It walks the window a
+couple of dates every 10 minutes, so full coverage takes hours instead of the
+daily sweep's 24.
+
+```bash
+python3 sentry.py --seed-observed   # baseline the window once, alerts nothing
+python3 sentry.py --gap-dryrun      # what would it ring for? no pushes, no writes
+```
 
 **Polling is the only option, and I checked properly.** No websocket, no SSE,
 and `If-None-Match` is ignored — you get an ETag back, but a conditional GET
@@ -111,7 +130,7 @@ flowchart LR
     L --> G["governor<br/>budget · 1 req/s · breaker"]
     G --> F["Fandango adapter<br/>kept-alive TLS in<br/>drop windows"]
     F --> D["detector<br/>70mm + availability"]
-    D --> E["engine<br/>probe · targets<br/>sniper · reconcile"]
+    D --> E["engine<br/>probe · gap scan · targets<br/>sniper · reconcile"]
     E --> N["notifier"]
     N --> P["Telegram / ntfy<br/>WhatsApp"]
     N -->|"only if delivered"| S[("state.json")]
@@ -119,12 +138,12 @@ flowchart LR
     E -.->|"heartbeat"| O["off-box deadman<br/>GitHub Actions"]
 ```
 
-Four detectors share one request budget. The horizon probe costs one request
+Five detectors share one request budget. The horizon probe costs one request
 per venue and answers "is there anything past the last date I know about" — it
 makes "nothing happened" nearly free, which is what pays for everything else.
-The target watch brute-forces dates I named. The refund sniper re-checks
-sold-out shows for returned seats. The daily reconcile catches what the probe's
-contiguity assumption misses.
+The gap scan walks the dates the probe structurally can't see. The target watch
+brute-forces dates I named. The refund sniper re-checks sold-out shows for
+returned seats. The daily reconcile is the backstop.
 
 More detail: [architecture with diagrams](docs/ARCHITECTURE.md) ·
 [decision-by-decision rationale](docs/architecture-notes.md) ·
