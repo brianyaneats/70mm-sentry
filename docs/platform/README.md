@@ -1,5 +1,7 @@
 # 70mm Sentry — platform generalization
 
+> **Paths moved (Oct 2026):** `platformd/` was split into `engine/`, `notify/`, `billing/`, and `app/`, and `adapters/` became `sources/`. Each has its own README. The phase docs keep the old names as written at the time.
+
 This is the plan-of-record for turning a single-tenant Fandango watcher into
 a multi-source, multi-tenant alerting platform. It does not overturn any of
 the five decisions in `docs/architecture-notes.md` — stdlib-only, poll
@@ -23,7 +25,7 @@ Check `git log` and the code, not this file, for what's actually landed.
         ▼                                                 ▼
  ┌──────────────┐   shared, per-source   ┌──────────────────────────┐
  │ subscriptions │◄── who watches what ──│      source adapter       │
- │  & drop       │                       │  (adapters/base.py seam)  │
+ │  & drop       │                       │  (sources/base.py seam)  │
  │  registry     │                       │  fetch / parse / health   │
  └──────┬────────┘                       └─────────────┬─────────────┘
         │                                               │
@@ -38,7 +40,7 @@ Check `git log` and the code, not this file, for what's actually landed.
  └──────────────┘
 ```
 
-1. **Source adapter** — one class per upstream (`adapters/base.py`'s
+1. **Source adapter** — one class per upstream (`sources/base.py`'s
    `SourceAdapter`, frozen contract, read it before touching anything in
    this decomposition). Owns fetch shape, parse shape, and "is this payload
    healthy" — nothing else. It never sleeps, never retries, never opens its
@@ -151,14 +153,14 @@ non-payers. Two reasons this is the right axis to sell, not a compromise:
 
 ## Source risk tiers
 
-Enforced in code via `adapters/base.py`'s `risk_tier` class attribute — not
+Enforced in code via `sources/base.py`'s `risk_tier` class attribute — not
 a policy document elsewhere that code can drift from. The kernel refuses to
 load a `RED` adapter at all; it refuses to place a `YELLOW` adapter's source
 on any paid or prepaid plan.
 
 | Tier | Meaning | Enforcement | Current example |
 |---|---|---|---|
-| **GREEN** | Sanctioned API, contractually authorized (or a public-data endpoint judged safe under sustained third-party precedent, with an owner-run live preflight before production traffic) | Paid tiers allowed | recreation.gov's availability endpoint (`adapters/recreation_gov.py`) — public government data, not formally an API contract, but years of unenforced third-party use; the module's own docstring calls this "an operational judgment call, not a legal guarantee." AMC's vendor API, once approved (`phase-0.md`), lands here properly — a real contract, not a judgment call. |
+| **GREEN** | Sanctioned API, contractually authorized (or a public-data endpoint judged safe under sustained third-party precedent, with an owner-run live preflight before production traffic) | Paid tiers allowed | recreation.gov's availability endpoint (`sources/recreation_gov.py`) — public government data, not formally an API contract, but years of unenforced third-party use; the module's own docstring calls this "an operational judgment call, not a legal guarantee." AMC's vendor API, once approved (`phase-0.md`), lands here properly — a real contract, not a judgment call. |
 | **YELLOW** | Public endpoint, tolerated-gray | Free tier only — never prepaid, never a paid SKU; disclosed "may go dark" risk in product copy | Fandango NAPI — `robots.txt` disallows `/napi/`, no published rate limit for the public site, tolerated in practice via 403/429 enforcement rather than an outright block (`docs/architecture-notes.md`, Decision 4; `ticket-sniper-domain` skill). Settled as permanently free in `phase-0.md`. |
 | **RED** | Requires circumvention of an access control | Never built, full stop | Queue-it token forging or unattended headless polling of AMC's public site to get seat-map data without the vendor API. Named explicitly in the `ticket-sniper-domain` skill's boundaries; no code in this repo does this and none is planned to. |
 
@@ -180,7 +182,7 @@ A tag that isn't asserted by a test is a tag that will silently stop firing
 the first time someone refactors the catch site around it.
 
 Four tags are adapter-facing and already named in the frozen contract
-(`adapters/base.py`, lines 21–26):
+(`sources/base.py`, lines 21–26):
 
 - **`[PIPE]`** — broken pipe, connection reset, or a dead kept-alive socket
   on fetch. `BrokenPipeError`, `ConnectionResetError`, and
@@ -204,7 +206,7 @@ Four tags are adapter-facing and already named in the frozen contract
   (`ticket-sniper-domain` skill: "distinguish self-imposed limits from
   upstream failures").
 - **`[PARSE]`** — the payload fetched fine but `parse()` raised. Per the
-  contract's own docstring (adapters/base.py:105–109), a parser must raise
+  contract's own docstring (sources/base.py:105–109), a parser must raise
   on an unrecognized shape rather than return `[]` — a silent empty list on
   a changed feed shape is indistinguishable from "nothing's on sale," which
   is precisely the failure mode this tag exists to surface instead of hide.
@@ -221,7 +223,7 @@ belong to layers 3–4, specified in `phase-3.md`:
   anyone," and it is the one condition that should page a human, not just
   sit in a log.
 
-Two more are governor-facing (`platformd/governor.py`), covering the
+Two more are governor-facing (`engine/governor.py`), covering the
 self-imposed denials that are deliberately distinct from upstream failures —
 conflating them is how a budget exhaustion gets misdiagnosed as an IP block:
 

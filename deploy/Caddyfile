@@ -1,0 +1,19 @@
+# Caddy terminates TLS (automatic Let's Encrypt for DROPWATCH_DOMAIN) and
+# is the ONLY way in: the app container publishes no ports.
+{
+	email {$ACME_EMAIL}
+}
+
+{$DROPWATCH_DOMAIN} {
+	encode gzip
+	reverse_proxy app:8787 {
+		# SET (not append) the real peer; the app keys its rate limiter
+		# on this header (DROPWATCH_CLIENT_IP_HEADER=X-Real-IP), so a
+		# client-sent X-Real-IP or X-Forwarded-For can't pick its bucket.
+		header_up X-Real-IP {remote_host}
+	}
+	log {
+		output stdout
+		format console
+	}
+}

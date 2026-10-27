@@ -1,0 +1,12 @@
+# Nightly Dropwatch backup: online sqlite backup -> deploy/backups/ (+ B2).
+# Install: see deploy/README.md "Backups". Assumes the repo is at
+# /opt/dropwatch; edit WorkingDirectory if not.
+[Unit]
+Description=Dropwatch sqlite backup
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/dropwatch/deploy
+ExecStart=/usr/bin/docker compose run --rm -T backup

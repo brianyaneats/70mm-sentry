@@ -19,3 +19,6 @@ report.html
 # an unrelated personal VS Code extension that happens to live here; not part
 # of this project and must never be published as if it were
 tools/
+
+# deploy: local backups on the VPS
+deploy/backups/

@@ -1,6 +1,6 @@
 name: tests
-# CI gate: the suite must pass on every push/PR — 139+ mocked tests that
-# previously only ran when someone remembered to run them locally.
+# CI gate: the whole suite (retired sentry + every Dropwatch component)
+# must pass on every push/PR. stdlib unittest only -- no pip install.
 
 on:
   push:
@@ -24,4 +24,7 @@ jobs:
       # tests import sentry, which loads config at module import; the live
       # config.json is untracked (it holds tokens), so seed from the example
       - run: cp config.example.json config.json
+      # retired sentry + repo-level checks (dependency direction)
       - run: python -m unittest discover -s tests -v
+      # sources/ engine/ notify/ billing/ app/ deploy/ -- each has tests/
+      - run: python -m unittest discover -s . -t . -v
