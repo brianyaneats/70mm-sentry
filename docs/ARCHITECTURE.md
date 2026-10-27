@@ -267,21 +267,22 @@ specific broke. That history is the most useful part of this repo:
 | Cadence tiers | One interval cannot serve both a drop hour and 3am |
 | Refund sniper | Listings arrive already sold out — "listed" ≠ "buyable" |
 | `announced` ledger | Three code paths each alerted on the same date |
-| Adapters + platformd | The same shape works for campsites, restocks, anything |
+| Sources + engine + app | The same shape works for campsites, restocks, anything |
 
 ```mermaid
 flowchart LR
     V0["v0<br/>loop + print"] --> V1["v1<br/>verified source<br/>+ politeness"]
     V1 --> V2["v2<br/>delivery-gated state<br/>+ alarms"]
     V2 --> V3["v3<br/>cadence tiers<br/>+ refund sniper"]
-    V3 --> V4["v4<br/>adapters + platformd<br/>multi-source, multi-tenant"]
+    V3 --> V4["v4<br/>sources + engine + app<br/>multi-source, multi-tenant"]
 ```
 
-The generalization is real, not aspirational: `adapters/` already contains a
-second working source (`recreation_gov.py`, 30 tests), and `platformd/` is a
-multi-tenant service — API, subscriber channels, delivery outbox, governor —
-with a small web UI branded **Dropwatch**. Run it with
-`python3 -m platformd.api --demo` and open `127.0.0.1:8787`. The plan of record
+The generalization is real, not aspirational: `sources/` already contains a
+second working source (`recreation_gov.py`, 30 tests), and `engine/` +
+`notify/` + `billing/` + `app/` make up a multi-tenant service (API,
+subscriber channels, delivery outbox, governor) with a small web UI branded
+**Dropwatch**. Run it with `python3 -m app.api --demo` and open
+`127.0.0.1:8787`. The plan of record
 is [docs/platform/README.md](platform/README.md).
 
 ---

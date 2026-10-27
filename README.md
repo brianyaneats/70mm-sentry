@@ -161,11 +161,15 @@ buy a ticket and that's where it stops.
 - `tests/` — 584 tests, all network mocked
   (`python3 -m unittest discover -s tests`). 233 cover the watcher itself. It's
   a lot, but every branch matters at a moment I can't reproduce on demand.
-- `adapters/` — Fandango plus `recreation_gov.py`, which was mostly a check
+- `sources/` — Fandango plus `recreation_gov.py`, which was mostly a check
   that the same shape works for something other than movies. It does.
-- `platformd/` — a multi-tenant version (API, subscriber channels, delivery
-  outbox, webhooks) with a small web UI called Dropwatch. Try it:
-  `python3 -m platformd.api --demo`, then open `127.0.0.1:8787`. Plan of
+  (`adapters/` is a thin alias kept so `sentry.py` imports unchanged.)
+- `engine/`, `notify/`, `billing/`, `app/`, `deploy/` — the multi-tenant
+  version, a campsite-alert product called Dropwatch. Each directory has its
+  own README and tests; dependencies only point one way
+  (`sources ← engine ← notify/billing ← app`). Try it:
+  `python3 -m app.api --demo`, then open `127.0.0.1:8787`. Production runs on
+  one VPS with Docker + Caddy: [deploy/README.md](deploy/README.md). Plan of
   record: [docs/platform/](docs/platform/README.md).
 - **Three notification channels, wired and covered by test**: Telegram
   (recommended primary), WhatsApp (CallMeBot relay or Meta's Cloud API), and
@@ -575,9 +579,8 @@ never ticket alerts — and preflight verdicts: refusal, blind payload, zero
 hits, budget projection); 19 in `test_watchdog.py` (staleness, dedup,
 re-nag, recovery, error capture, and the read-only `--check` probe); 28 in
 `test_report.py` (the availability-replay analytics side-car). The remaining
-271 cover the source adapters (`test_fandango_adapter.py`,
-`test_recreation_gov.py`) and the platform layer (`test_platform_*.py`:
-API, channels, core, governor, outbox, runner, webhook). Live layer checks,
+rest cover the Dropwatch components, each in its own `<component>/tests/`
+(`python3 -m unittest discover -s . -t .`). Live layer checks,
 not run by the suite: `--test-push` plus polling the ntfy topic JSON to
 confirm receipt.
 

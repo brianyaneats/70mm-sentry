@@ -6,7 +6,7 @@ Work through them in order, because each section unblocks the next.
 ## 1. Business basics
 - [ ] Pick the operator: you personally, or an LLC. An LLC keeps refunds and disputes off your personal liability, but it can come later.
 - [ ] Set up a support inbox, e.g. `support@<domain>`. Stripe requires one and the legal pages cite it.
-- [ ] Fill every `[bracketed]` field in `platformd/static/terms.html` and `privacy.html`: legal name, city/state, support email.
+- [ ] Fill every `[bracketed]` field in `app/static/terms.html` and `privacy.html`: legal name, city/state, support email, hosting provider, backup storage provider.
 - [ ] Decide on price and refund policy. The terms page currently says 14 days, refund on request.
 - [ ] Read recreation.gov's current Terms of Use in a browser. We only read public availability and never book. Note the date you checked.
 - [ ] Do a quick name check on "Dropwatch" (USPTO search plus domain availability) before you print it anywhere.
@@ -28,10 +28,19 @@ Work through them in order, because each section unblocks the next.
   - Install `unattended-upgrades`.
 - [ ] Install Docker Engine and the compose plugin, from Docker's apt repo rather than snap.
 - [ ] Turn on the provider's weekly snapshots, about +20% of the box price.
-- [ ] Create off-box backup storage: a Backblaze B2 or S3 bucket, plus an app key scoped to that one bucket. The deploy session ships a nightly `sqlite3 .backup` job that uploads to it.
+- [ ] Create off-box backup storage: a private Backblaze B2 (or S3) bucket, an app key scoped to that one bucket, and a lifecycle rule (e.g. keep 30 days). Put the values in `BACKUP_S3_*` in `deploy/.env`.
 - [ ] Add an uptime monitor: Healthchecks.io or UptimeRobot hitting `https://<domain>/api/status`, alerting your phone.
-- [ ] After the first deploy, watch the logs for `[REFUSED]`. Some sites block datacenter IPs. If recreation.gov does, the fix is a different provider or region, not working around the block.
-- [ ] Decide on Fly: once the VPS is live, delete `fly.toml` or keep it as a fallback.
+- [ ] Add a read-only GitHub deploy key for the box, so it can `git clone`/`pull` the private repo.
+- [ ] First deploy: follow `deploy/README.md` "First deploy". In short:
+  - Clone to `/opt/dropwatch`.
+  - `cp deploy/.env.example deploy/.env` and `chmod 600` it.
+  - Set `DROPWATCH_DOMAIN`, `ACME_EMAIL`, and `DROPWATCH_PUBLIC_URL`.
+  - `sudo install -d -o 10001 -g 10001 deploy/backups`.
+  - Run `deploy/release.sh`.
+- [ ] Right after the first deploy, run `docker compose exec app python -m app.probe 232447` in `deploy/`. It sends one real request from the VPS. `ok=True` means recreation.gov answers this IP. `problems=REFUSED` means it blocks datacenter IPs; the fix is a different provider or region, not working around the block. Then watch the logs for `[REFUSED]` for a day.
+- [ ] Do one real subscribe → verify with your own ntfy topic, on the live site.
+- [ ] Enable the nightly backup timer (`deploy/README.md` "Backups"), run `docker compose run --rm backup` once, and confirm the `[BACKUP] uploaded` line and the object in the bucket.
+- [x] Fly decided: `fly.toml` was removed, and the VPS is the only target.
 
 ## 4. Stripe
 - [ ] Create the account and activate it. You enter the business details, bank account, and SSN/EIN; never paste them into a chat.
@@ -48,7 +57,7 @@ Work through them in order, because each section unblocks the next.
   - URL: `https://<domain>/api/stripe/webhook`.
   - Events: `checkout.session.completed`, `customer.subscription.updated`, `customer.subscription.deleted`.
   - Copy its signing secret (`whsec_…`).
-- [ ] Put the secret **only** in the VPS env file (`chmod 600`), never in the repo. The public values go in the same file: `DROPWATCH_PAYMENT_LINK`, `DROPWATCH_PORTAL_URL`, `DROPWATCH_PRICE_LABEL`, `DROPWATCH_PUBLIC_URL`.
+- [ ] Put the secret **only** in `deploy/.env` on the VPS (`chmod 600`, gitignored), never in the repo. The public values go in the same file: `DROPWATCH_PAYMENT_LINK`, `DROPWATCH_PORTAL_URL`, `DROPWATCH_PRICE_LABEL`, `DROPWATCH_PUBLIC_URL`. Set the link and the secret together; the app refuses to boot with only one of them. Apply with `docker compose up -d` in `deploy/`.
 - [ ] Settings:
   - Turn on email receipts.
   - Keep Radar's default rules.
@@ -64,5 +73,5 @@ Work through them in order, because each section unblocks the next.
   - `[POLL] budget-bound` means watch demand exceeds the request budget, so alerts are slowing.
   - `[REFUSED]` or `[BREAKER]` means upstream is unhappy.
   - `[ZERO-DELIVERED]` means an alert reached nobody.
-- [ ] Restore a backup onto a scratch box once. An untested backup isn't a backup.
+- [ ] Restore a backup onto a scratch box once (`deploy/README.md` "Restore"). An untested backup isn't a backup.
 - [ ] Optional next channel: an email provider account (Postmark or Resend) with domain verification (SPF/DKIM). It's the biggest conversion win for campers, who won't install ntfy.

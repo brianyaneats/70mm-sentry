@@ -1,0 +1,12 @@
+# Allowlist build context for deploy/Dockerfile: ship code + catalog only,
+# never tests, logs, backups, .env, or local config.
+*
+!sources/
+!engine/
+!notify/
+!billing/
+!app/
+!deploy/__init__.py
+!deploy/backup.py
+**/tests/
+**/__pycache__

@@ -1,0 +1,50 @@
+name: image
+# Builds the Dropwatch image exactly as the VPS does, then boots it:
+# healthcheck must pass, a bad config must refuse to start, and SIGTERM
+# must exit 0 with a clean stop. Nothing is pushed anywhere.
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: compose file is valid
+        working-directory: deploy
+        run: |
+          cp .env.example .env
+          sed -i 's/^ACME_EMAIL=$/ACME_EMAIL=ci@example.com/' .env
+          docker compose config --quiet
+      - name: build
+        run: docker build -f deploy/Dockerfile -t dropwatch:ci .
+      - name: image ships no tests, secrets or repo clutter
+        run: |
+          docker run --rm dropwatch:ci sh -c \
+            'test ! -e /app/app/tests && test ! -e /app/.env && test ! -e /app/sentry.py && ls /app'
+      - name: refuses a half-configured billing setup
+        run: |
+          set +e
+          docker run --rm -e DROPWATCH_PAYMENT_LINK=https://buy.stripe.com/x dropwatch:ci
+          code=$?
+          set -e
+          test "$code" = 2
+      - name: boots healthy and stops cleanly on SIGTERM
+        run: |
+          docker run -d --name dw -p 8787:8787 dropwatch:ci
+          for i in $(seq 1 30); do
+            s=$(docker inspect -f '{{.State.Health.Status}}' dw)
+            [ "$s" = healthy ] && break
+            sleep 2
+          done
+          test "$s" = healthy
+          curl -fsS http://127.0.0.1:8787/api/status
+          docker stop -t 30 dw
+          test "$(docker inspect -f '{{.State.ExitCode}}' dw)" = 0
+          docker logs dw 2>&1 | grep -F '[RUNNER] serve stopped clean=True'

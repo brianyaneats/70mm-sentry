@@ -1,0 +1,96 @@
+# Dropwatch on one VPS: Caddy (TLS, :80/:443) -> app (:8787, internal only).
+#   cd deploy && docker compose up -d --build
+# Settings come from deploy/.env (copy .env.example; chmod 600). ONE app
+# replica, always: sqlite on one volume means one writer.
+name: dropwatch
+
+x-hardening: &hardening
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+  app:
+    <<: *hardening
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: dropwatch:${DROPWATCH_IMAGE_TAG:-latest}
+    restart: unless-stopped
+    # no `ports:` on purpose -- only Caddy reaches it, so X-Real-IP can
+    # only ever come from Caddy
+    expose:
+      - "8787"
+    environment:
+      DROPWATCH_TRUST_PROXY: "1"
+      DROPWATCH_CLIENT_IP_HEADER: X-Real-IP
+      DROPWATCH_PUBLIC_URL: ${DROPWATCH_PUBLIC_URL:-}
+      DROPWATCH_NOTICE: ${DROPWATCH_NOTICE:-}
+      DROPWATCH_CATALOG: ${DROPWATCH_CATALOG:-}
+      DROPWATCH_RUNNER_INTERVAL: ${DROPWATCH_RUNNER_INTERVAL:-5}
+      DROPWATCH_PAYMENT_LINK: ${DROPWATCH_PAYMENT_LINK:-}
+      DROPWATCH_PORTAL_URL: ${DROPWATCH_PORTAL_URL:-}
+      DROPWATCH_PRICE_LABEL: ${DROPWATCH_PRICE_LABEL:-}
+      STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
+    volumes:
+      - data:/data
+    # serve.py stops its threads on SIGTERM; an in-flight upstream fetch
+    # can take up to 10s, so give it more than Docker's default 10s
+    stop_grace_period: 30s
+    mem_limit: 256m
+    pids_limit: 128
+    read_only: true
+    tmpfs:
+      - /tmp
+
+  caddy:
+    <<: *hardening
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      DROPWATCH_DOMAIN: ${DROPWATCH_DOMAIN:?set DROPWATCH_DOMAIN in deploy/.env}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL in deploy/.env}
+    cap_add:
+      - NET_BIND_SERVICE
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  # One-shot: `docker compose run --rm backup` (the systemd timer does this
+  # nightly). Same image, so the backup tool and the schema always match.
+  backup:
+    <<: *hardening
+    image: dropwatch:${DROPWATCH_IMAGE_TAG:-latest}
+    profiles: ["ops"]
+    command: ["python", "-m", "deploy.backup", "run"]
+    environment:
+      DROPWATCH_DB: /data/dropwatch.sqlite3
+      BACKUP_DIR: /backups
+      BACKUP_KEEP_DAYS: ${BACKUP_KEEP_DAYS:-14}
+      BACKUP_S3_ENDPOINT: ${BACKUP_S3_ENDPOINT:-}
+      BACKUP_S3_REGION: ${BACKUP_S3_REGION:-}
+      BACKUP_S3_BUCKET: ${BACKUP_S3_BUCKET:-}
+      BACKUP_S3_PREFIX: ${BACKUP_S3_PREFIX:-dropwatch/}
+      BACKUP_S3_ACCESS_KEY_ID: ${BACKUP_S3_ACCESS_KEY_ID:-}
+      BACKUP_S3_SECRET_ACCESS_KEY: ${BACKUP_S3_SECRET_ACCESS_KEY:-}
+    volumes:
+      - data:/data
+      - ./backups:/backups
+
+volumes:
+  data:
+  caddy_data:
+  caddy_config:

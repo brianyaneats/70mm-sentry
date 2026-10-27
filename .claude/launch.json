@@ -4,7 +4,7 @@
     {
       "name": "dropwatch-demo",
       "runtimeExecutable": "python3",
-      "runtimeArgs": ["-m", "platformd.api", "--demo"],
+      "runtimeArgs": ["-m", "app.api", "--demo"],
       "port": 8787
     }
   ]
