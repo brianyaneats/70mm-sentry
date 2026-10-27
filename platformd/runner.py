@@ -71,14 +71,14 @@ def _pending_count(conn):
     return row["n"]
 
 
-def run_once(conn, channels, now=None):
+def run_once(conn, channels, now=None, public_url=None):
     """Run exactly one dispatch tick and log its [RUNNER] heartbeat.
     Returns (pending_before, pending_after) -- mostly for tests.
     """
     if now is None:
         now = time.time()
     before = _pending_count(conn)
-    outbox.dispatch(conn, channels, now=now)
+    outbox.dispatch(conn, channels, now=now, public_url=public_url)
     after = _pending_count(conn)
     _log.log(_log.TAG_RUNNER, "tick complete",
               pending_before=before, pending_after=after)

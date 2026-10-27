@@ -21,6 +21,16 @@ Endpoints, all JSON, request bodies capped at MAX_BODY_BYTES (413 over,
     POST /api/subscribe    -- {drop_id, channel, address, tier?} -> subscription_id
     POST /api/verify       -- {subscription_id, code} -> unsubscribe_token | 403
     POST /api/unsubscribe  -- {token} -> ok
+    GET  /api/campgrounds  -- ?q=<name or recreation.gov URL> -> top matches
+    POST /api/subscribe    -- also {campground_id, date_from, date_to,
+                              channel, address}: a watch on one
+                              campground's dates (drop "rg-<id>")
+    POST /api/checkout     -- {subscription_id, token} -> {url} (Stripe
+                              Payment Link carrying the watch reference)
+    POST /api/stripe/webhook -- Stripe-signed events; see platformd.billing.
+                              Exempt from the IP limiter (Stripe bursts
+                              from few IPs); the signature is the gate.
+    GET  /terms, /privacy  -- static legal pages
     GET  /unsubscribe      -- renders a confirm page for ?token=...; the
                               GET itself is inert (safe method -- it
                               changes nothing), a click on the page's own
@@ -59,18 +69,22 @@ log line -- only subscription_id ever identifies a row in output/logs.
 """
 
 import argparse
+import datetime as dt
 import json
 import os
 import re
+import secrets
 import tempfile
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from platformd import core, db, log as _log
+from platformd import billing, core, db, log as _log
 
 MAX_BODY_BYTES = 16 * 1024
+# Stripe event bodies embed whole objects; 16K is too tight for them.
+MAX_STRIPE_BODY_BYTES = 256 * 1024
 
 VALID_CHANNELS = ("telegram", "discord", "ntfy", "webhook")
 
@@ -88,14 +102,74 @@ VALID_CHANNELS = ("telegram", "discord", "ntfy", "webhook")
 # Per-channel address sanity checks. These are shape checks only -- no
 # network call ever validates an address actually resolves.
 _ADDRESS_PATTERNS = {
-    "telegram": re.compile(r"^(@[A-Za-z0-9_]{5,32}|-?\d{5,15})$"),
-    "discord": re.compile(r"^https://discord(?:app)?\.com/api/webhooks/\d+/[\w.-]+$"),
-    "ntfy": re.compile(r"^[A-Za-z0-9_-]{1,64}$"),
+    "telegram": re.compile(r"^(@[A-Za-z0-9_]{5,32}|-?\d{5,15})\Z"),
+    "discord": re.compile(r"^https://discord(?:app)?\.com/api/webhooks/\d+/[\w.-]+\Z"),
+    "ntfy": re.compile(r"^[A-Za-z0-9_-]{1,64}\Z"),
 }
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 INDEX_PATH = os.path.join(STATIC_DIR, "index.html")
 HOW_PATH = os.path.join(STATIC_DIR, "how.html")
+LEGAL_PAGES = {"/terms": os.path.join(STATIC_DIR, "terms.html"),
+               "/privacy": os.path.join(STATIC_DIR, "privacy.html")}
+
+# A watch covers at most this many nights: each extra month of range is
+# another upstream request per pass, paid for out of a shared budget.
+MAX_WATCH_DAYS = 31
+MAX_WATCH_HORIZON_DAYS = 366
+CAMPGROUND_RESULTS = 12
+_REC_GOV_URL = re.compile(r"recreation\.gov/camping/campgrounds/(\d+)")
+
+
+def load_campgrounds(path):
+    """{id: {"id", "name", "parent", "state"}} from tools/build_campgrounds.py
+    output, or {} when no index is configured."""
+    if not path:
+        return {}
+    with open(path) as fh:
+        return {c["id"]: c for c in json.load(fh)}
+
+
+def search_campgrounds(index, q):
+    """Prefix matches on the name first, then substring matches on name
+    or parent (park/forest). A pasted recreation.gov URL resolves by id."""
+    q = (q or "").strip()
+    m = _REC_GOV_URL.search(q)
+    if m:
+        hit = index.get(m.group(1))
+        return [hit] if hit else []
+    q = q.lower()
+    if len(q) < 2:
+        return []
+    prefix, contains = [], []
+    for c in index.values():
+        name = c["name"].lower()
+        if name.startswith(q):
+            prefix.append(c)
+        elif q in name or q in c["parent"].lower():
+            contains.append(c)
+        if len(prefix) >= CAMPGROUND_RESULTS:
+            break
+    return (prefix + contains)[:CAMPGROUND_RESULTS]
+
+
+def _parse_watch_dates(date_from, date_to, today):
+    """(date_from, date_to) as ISO strings, or raise ValueError with a
+    message fit for the client."""
+    try:
+        start = dt.date.fromisoformat(date_from)
+        end = dt.date.fromisoformat(date_to)
+    except (TypeError, ValueError):
+        raise ValueError("dates must be YYYY-MM-DD") from None
+    if start > end:
+        raise ValueError("check-in must be on or before check-out")
+    if start < today:
+        raise ValueError("dates must not be in the past")
+    if (end - start).days >= MAX_WATCH_DAYS:
+        raise ValueError("a watch can cover at most %d nights" % MAX_WATCH_DAYS)
+    if (end - today).days > MAX_WATCH_HORIZON_DAYS:
+        raise ValueError("dates must be within a year")
+    return start.isoformat(), end.isoformat()
 
 # Minimal standalone confirm page for GET /unsubscribe?token=... -- reuses
 # index.html's design tokens (ink/bg/surface/hairline/radius) for a
@@ -206,7 +280,7 @@ DEMO_HOST = "127.0.0.1"
 DEMO_PORT = 8787
 
 
-_BARE_TELEGRAM_HANDLE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
+_BARE_TELEGRAM_HANDLE = re.compile(r"^[A-Za-z0-9_]{5,32}\Z")
 
 
 def _normalize_address(channel, address):
@@ -295,13 +369,63 @@ def _send_json(handler, status, payload):
         pass
 
 
+# Sent on every response. HTML gets a per-response CSP nonce on top (see
+# _html_with_nonce); JSON responses get the strictest possible policy.
+_BASELINE_HEADERS = (
+    ("X-Content-Type-Options", "nosniff"),
+    ("Referrer-Policy", "no-referrer"),     # /unsubscribe carries its token
+    ("X-Frame-Options", "DENY"),             # legacy twin of frame-ancestors
+    ("Cross-Origin-Opener-Policy", "same-origin"),
+    ("Permissions-Policy", "camera=(), microphone=(), geolocation=()"),
+    # Browsers ignore HSTS over plain http, so this is a no-op locally and
+    # binding behind the TLS edge in production.
+    ("Strict-Transport-Security", "max-age=31536000; includeSubDomains"),
+)
+
+_CSP_HTML = ("default-src 'none'; script-src 'nonce-%s'; "
+             "style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+             "connect-src 'self'; base-uri 'none'; form-action 'self'; "
+             "frame-ancestors 'none'")
+_CSP_JSON = "default-src 'none'; frame-ancestors 'none'"
+
+
+def _html_with_nonce(body):
+    """Stamp a fresh nonce on every <script> tag; returns (body, nonce).
+    A nonce instead of 'unsafe-inline' means an injected <script> --
+    should any template ever echo user input -- simply doesn't run."""
+    nonce = secrets.token_urlsafe(16)
+    return body.replace(b"<script>", b'<script nonce="%s">' % nonce.encode()), nonce
+
+
 class _Handler(BaseHTTPRequestHandler):
     # Set on the subclass built by make_server().
     db_path = None
     channels = None
     limiter = None
     trust_proxy = False
+    client_ip_header = None
+    campgrounds = {}
+    stripe_webhook_secret = None
+    payment_link = None
+    portal_url = None
+    price_label = None
     server_version = "DropwatchAPI/1"
+    sys_version = ""          # don't advertise the Python build in Server:
+    # Per-connection socket timeout: without one, a client that opens a
+    # connection and never finishes the request pins a thread forever.
+    timeout = 30
+    _csp_nonce = None
+
+    def end_headers(self):
+        for name, value in _BASELINE_HEADERS:
+            self.send_header(name, value)
+        if self._csp_nonce:
+            self.send_header("Content-Security-Policy",
+                             _CSP_HTML % self._csp_nonce)
+        else:
+            self.send_header("Content-Security-Policy", _CSP_JSON)
+        self._csp_nonce = None     # never leak onto a keep-alive sibling
+        super().end_headers()
 
     def log_message(self, fmt, *args):
         # Silence BaseHTTPRequestHandler's default per-request stderr line.
@@ -325,16 +449,26 @@ class _Handler(BaseHTTPRequestHandler):
         It's honored ONLY when trust_proxy=True, an explicit deployment-
         time opt-in for a topology where a real reverse proxy sits in
         front of us and can be trusted to have set (or overwritten) it.
-        Even then, only the FIRST hop is used -- the client-facing edge
-        of whatever proxy chain terminates at that trusted proxy, which
-        is the only hop trust_proxy=True actually vouches for.
+        Even then, only the LAST hop is used. Proxies APPEND the peer
+        they saw (nginx's $proxy_add_x_forwarded_for, Fly's edge, ...),
+        so everything left of the final entry is whatever the client
+        sent -- keying on the first hop let a client mint a fresh bucket
+        per request by sending its own X-Forwarded-For.
+
+        client_ip_header names a header the proxy SETS outright (Fly's
+        Fly-Client-IP); it wins over X-Forwarded-For because there is
+        nothing for the client to prepend to.
         """
         if self.trust_proxy:
+            if self.client_ip_header:
+                owned = (self.headers.get(self.client_ip_header) or "").strip()
+                if owned:
+                    return owned
             xff = self.headers.get("X-Forwarded-For")
             if xff:
-                first_hop = xff.split(",")[0].strip()
-                if first_hop:
-                    return first_hop
+                last_hop = xff.split(",")[-1].strip()
+                if last_hop:
+                    return last_hop
         return self.client_address[0]
 
     def _read_body_or_error(self):
@@ -381,6 +515,12 @@ class _Handler(BaseHTTPRequestHandler):
             return self._get_status()
         if path == "/unsubscribe":
             return self._serve_unsubscribe_page(parsed)
+        if path == "/api/campgrounds":
+            q = (parse_qs(parsed.query).get("q") or [""])[0]
+            return _send_json(self, 200, {
+                "campgrounds": search_campgrounds(self.campgrounds, q)})
+        if path in LEGAL_PAGES:
+            return self._serve_html_file(LEGAL_PAGES[path])
         _send_json(self, 404, {"error": "not found"})
 
     def _serve_unsubscribe_page(self, parsed):
@@ -392,8 +532,12 @@ class _Handler(BaseHTTPRequestHandler):
         # inline <script>, never as raw HTML -- json.dumps handles quote/
         # backslash escaping, and the "</" guard stops a token containing
         # "</script>" from breaking out of the script block early.
-        token_js = json.dumps(token).replace("</", "<\\/")
+        # Escape every "<", not just "</": "<!--" inside a script block
+        # flips the parser into script-data-escaped state, and \u003c is
+        # identical to "<" once the JS string is evaluated.
+        token_js = json.dumps(token).replace("<", "\\u003c")
         body = (_UNSUBSCRIBE_PAGE_HTML % {"token_js": token_js}).encode("utf-8")
+        body, self._csp_nonce = _html_with_nonce(body)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -413,6 +557,7 @@ class _Handler(BaseHTTPRequestHandler):
         except OSError:
             _send_json(self, 500, {"error": "ui not found"})
             return
+        body, self._csp_nonce = _html_with_nonce(body)
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -428,6 +573,8 @@ class _Handler(BaseHTTPRequestHandler):
             drops = core.list_drops(conn, status="active")
             catalog = []
             for d in drops:
+                if d["adapter"]:
+                    continue  # a campground someone watches, not a listing
                 catalog.append({
                     "id": d["id"],
                     "title": d["title"],
@@ -436,7 +583,13 @@ class _Handler(BaseHTTPRequestHandler):
                     "status": d["status"],
                     "health": _drop_health(conn, d),
                 })
-            _send_json(self, 200, {"drops": catalog, "demo": self.demo})
+            _send_json(self, 200, {
+                "drops": catalog, "demo": self.demo, "notice": self.notice,
+                "campgrounds": bool(self.campgrounds),
+                "billing": {"enabled": bool(self.payment_link
+                                            and self.stripe_webhook_secret),
+                            "price_label": self.price_label,
+                            "portal_url": self.portal_url}})
         finally:
             conn.close()
 
@@ -453,6 +606,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
+        if path == "/api/stripe/webhook":
+            return self._post_stripe_webhook()
         ip = self._client_ip()
 
         if not self.limiter.allow(ip):
@@ -482,10 +637,26 @@ class _Handler(BaseHTTPRequestHandler):
             return self._post_verify(data)
         if path == "/api/unsubscribe":
             return self._post_unsubscribe(data)
+        if path == "/api/checkout":
+            return self._post_checkout(data)
         _send_json(self, 404, {"error": "not found"})
 
     def _post_subscribe(self, data):
         drop_id = data.get("drop_id")
+        date_from = date_to = campground = None
+        if data.get("campground_id") is not None:
+            campground = self.campgrounds.get(str(data["campground_id"]))
+            if campground is None:
+                _send_json(self, 404, {"error": "unknown campground"})
+                return
+            try:
+                date_from, date_to = _parse_watch_dates(
+                    data.get("date_from"), data.get("date_to"),
+                    dt.date.today())
+            except ValueError as exc:
+                _send_json(self, 400, {"error": str(exc)})
+                return
+            drop_id = "rg-%s" % campground["id"]
         channel = data.get("channel")
         address = data.get("address")
         # Tier is NEVER taken from the client. The notify-delay split is
@@ -523,18 +694,35 @@ class _Handler(BaseHTTPRequestHandler):
 
         conn = self._conn()
         try:
+            now = time.time()
+            if campground is not None:
+                core.register_drop(
+                    conn, drop_id, campground["name"],
+                    description=campground["parent"], source="recreation.gov",
+                    risk_tier="green", now=now, adapter="recreation_gov",
+                    target={"campground_id": campground["id"]})
             drop = core.get_drop(conn, drop_id)
             if drop is None or drop["status"] != "active":
                 _send_json(self, 404, {"error": "unknown drop"})
                 return
 
-            now = time.time()
-            row = core.subscribe(conn, drop_id, channel, address, tier, now,
-                                  webhook_secret=webhook_secret)
+            try:
+                row = core.subscribe(conn, drop_id, channel, address, tier,
+                                     now, webhook_secret=webhook_secret,
+                                     date_from=date_from, date_to=date_to)
+            except core.ResendCooldown as exc:
+                _send_json(self, 429, {
+                    "error": "a code was just sent there - try again in a minute",
+                    "retry_after": int(exc.retry_after) + 1})
+                return
 
             # An already-active dedup hit (see core.subscribe's docstring)
             # has no fresh verify_code to send -- nothing to deliver.
-            if row["status"] == "pending_verify" and row["verify_code"]:
+            # created_at == now marks a row core.subscribe just minted; a
+            # row returned from inside the resend cooldown already had its
+            # code delivered and must not be sent again.
+            if (row["status"] == "pending_verify" and row["verify_code"]
+                    and row["created_at"] == now):
                 sender = self.channels[channel]
                 try:
                     if channel == "webhook":
@@ -623,9 +811,68 @@ class _Handler(BaseHTTPRequestHandler):
             conn.close()
 
 
+    def _post_checkout(self, data):
+        """Hand back the Payment Link for a verified watch. The unsubscribe
+        token proves the caller is the one who just verified it."""
+        if not (self.payment_link and self.stripe_webhook_secret):
+            _send_json(self, 404, {"error": "payments are not enabled"})
+            return
+        token = data.get("token")
+        try:
+            subscription_id = int(data.get("subscription_id"))
+        except (TypeError, ValueError):
+            _send_json(self, 400, {"error": "subscription_id is required"})
+            return
+        conn = self._conn()
+        try:
+            row = core.get_subscription(conn, subscription_id)
+            if (row is None or row["status"] != "active"
+                    or not isinstance(token, str)
+                    or not secrets.compare_digest(row["unsub_token"] or "", token)):
+                _send_json(self, 403, {"error": "unknown watch"})
+                return
+            _send_json(self, 200, {
+                "url": billing.checkout_url(self.payment_link, subscription_id)})
+        finally:
+            conn.close()
+
+    def _post_stripe_webhook(self):
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            length = -1
+        if not 0 < length <= MAX_STRIPE_BODY_BYTES:
+            _send_json(self, 413 if length > 0 else 400, {"error": "bad body"})
+            return
+        raw = self.rfile.read(length)
+        now = time.time()
+        if not billing.verify_signature(raw, self.headers.get("Stripe-Signature"),
+                                        self.stripe_webhook_secret, now):
+            _log.log(_log.TAG_BILLING, "webhook signature rejected",
+                     ip=self._client_ip())
+            _send_json(self, 400, {"error": "bad signature"})
+            return
+        try:
+            event = json.loads(raw)
+        except ValueError:
+            _send_json(self, 400, {"error": "malformed JSON"})
+            return
+        conn = self._conn()
+        try:
+            outcome = billing.handle_event(conn, event, now)
+        finally:
+            conn.close()
+        _log.log(_log.TAG_BILLING, "webhook applied",
+                 event_type=event.get("type"), outcome=outcome)
+        _send_json(self, 200, {"received": True})
+
+
 def make_server(db_path, channels, host="127.0.0.1", port=0,
                  rate_limit_capacity=10, rate_limit_window_seconds=60.0,
-                 demo=False, trust_proxy=False):
+                 demo=False, trust_proxy=False, notice=None,
+                 client_ip_header=None, campgrounds=None,
+                 stripe_webhook_secret=None, payment_link=None,
+                 portal_url=None, price_label=None):
     """Build (but do not start) a ThreadingHTTPServer for the drop platform.
 
     db_path: sqlite file path. Every request opens its own connection
@@ -659,11 +906,23 @@ def make_server(db_path, channels, host="127.0.0.1", port=0,
     Handler.channels = channels
     Handler.limiter = limiter
     Handler.trust_proxy = bool(trust_proxy)
+    Handler.client_ip_header = client_ip_header or None
     # Demo mode is a client-visible fact, not a secret: the UI must tell
     # the user that codes go to the server console, not their phone --
     # otherwise the flow reads as broken to the first real person who
     # tries it with a real handle.
     Handler.demo = bool(demo)
+    # Operator-set banner for a deployment whose promise is ahead of its
+    # plumbing (e.g. signups live, detection not yet) -- the page must
+    # say so rather than let a subscriber wait on an alert that can't come.
+    Handler.notice = notice or None
+    Handler.campgrounds = campgrounds or {}
+    # Payments are on only when BOTH halves exist: a checkout link with no
+    # webhook secret would take money and never grant anything.
+    Handler.stripe_webhook_secret = stripe_webhook_secret or None
+    Handler.payment_link = payment_link or None
+    Handler.portal_url = portal_url or None
+    Handler.price_label = price_label or None
 
     return ThreadingHTTPServer((host, port), Handler)
 

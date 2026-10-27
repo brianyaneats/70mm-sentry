@@ -48,7 +48,7 @@ from urllib.parse import urlparse
 # pathological address can't bloat storage or log lines. This is the
 # shape check used at subscribe time; is_safe_url() below does the
 # deeper (still request-shape-only) safety check.
-WEBHOOK_ADDRESS_PATTERN = re.compile(r"^https://\S{1,504}$")
+WEBHOOK_ADDRESS_PATTERN = re.compile(r"^https://\S{1,504}\Z")
 
 
 def _hostname_from_url(url):
@@ -100,11 +100,24 @@ def is_safe_url(url):
         # out of scope here; see module docstring.
         return True, None
 
-    if (ip.is_private or ip.is_loopback or ip.is_link_local
-            or ip.is_reserved or ip.is_unspecified or ip.is_multicast):
+    if not is_public_ip(ip):
         return False, "literal IP host is in a private/reserved/loopback/link-local range"
 
     return True, None
+
+
+def is_public_ip(ip):
+    """True only for globally routable unicast. `not is_global` is the
+    load-bearing test: the old private/loopback/link-local/... list let
+    100.64.0.0/10 (carrier-grade NAT, used for internal overlays) through,
+    because that range is neither private nor global. IPv4-mapped IPv6
+    is unwrapped first so ::ffff:10.0.0.1 is judged as 10.0.0.1."""
+    if isinstance(ip, str):
+        ip = ipaddress.ip_address(ip)
+    mapped = getattr(ip, "ipv4_mapped", None)
+    if mapped is not None:
+        ip = mapped
+    return ip.is_global and not ip.is_multicast
 
 
 # ---------- signing ----------

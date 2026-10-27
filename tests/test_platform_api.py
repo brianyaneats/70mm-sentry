@@ -242,7 +242,7 @@ class PlatformAPITestCase(unittest.TestCase):
         status, _, text, headers = http_request(self.base_url, "GET", "/")
         self.assertEqual(status, 200)
         self.assertIn("text/html", headers.get("Content-Type", ""))
-        self.assertIn("Know the moment it drops.", text)
+        self.assertIn("Know the moment your campsite opens.", text)
 
     def test_get_index_lists_webhook_channel_option(self):
         status, _, text, _ = http_request(self.base_url, "GET", "/")

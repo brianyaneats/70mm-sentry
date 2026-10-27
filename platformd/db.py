@@ -16,7 +16,7 @@ import sqlite3
 # Bump when SCHEMA changes. Additive columns also go in _ADDITIVE_COLUMNS
 # so an existing on-disk db gets them via ALTER TABLE (see
 # _apply_migrations); a structural change needs a real migration step.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # (table, column, "column DDL") for every column added after a table's
 # original shape -- applied to older databases in order.
@@ -27,6 +27,10 @@ _ADDITIVE_COLUMNS = (
      "zero_delivered_logged INTEGER NOT NULL DEFAULT 0"),
     ("events", "recovered_after_zero_logged",
      "recovered_after_zero_logged INTEGER NOT NULL DEFAULT 0"),
+    ("drops", "adapter", "adapter TEXT"),
+    ("drops", "target_json", "target_json TEXT"),
+    ("subscriptions", "date_from", "date_from TEXT"),
+    ("subscriptions", "date_to", "date_to TEXT"),
 )
 
 SCHEMA = """
@@ -114,6 +118,31 @@ CREATE TABLE IF NOT EXISTS governor (
     breaker_fails INTEGER NOT NULL DEFAULT 0,
     breaker_open_until REAL,
     last_request_at REAL
+);
+
+-- (drop, date) pairs the poller has seen at least once. A unit is only a
+-- "new listing" if its date was already baselined; otherwise a date
+-- rolling into a watch window would page for every site already open.
+-- Paid access, per destination (channel+address) rather than per
+-- subscription: one Stripe subscription covers every watch that
+-- destination has. Written only by the verified Stripe webhook.
+CREATE TABLE IF NOT EXISTS entitlements (
+    channel TEXT NOT NULL,
+    address TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('active', 'inactive')),
+    stripe_customer TEXT,
+    stripe_subscription TEXT,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (channel, address)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entitlements_stripe_sub
+    ON entitlements(stripe_subscription);
+
+CREATE TABLE IF NOT EXISTS poll_baseline (
+    drop_id TEXT NOT NULL,
+    date TEXT NOT NULL,
+    PRIMARY KEY (drop_id, date)
 );
 """
 

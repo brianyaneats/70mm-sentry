@@ -142,7 +142,7 @@ def _parse_retry_after(response_body):
 # duplicated rather than shared to keep this module import-independent of
 # platformd.api).
 DISCORD_WEBHOOK_URL_PATTERN = re.compile(
-    r"^https://discord(?:app)?\.com/api/webhooks/\d+/[\w.-]+$"
+    r"^https://discord(?:app)?\.com/api/webhooks/\d+/[\w.-]+\Z"
 )
 
 # Discord hard-truncates (400s) any content field over this length -- we
@@ -201,7 +201,7 @@ class DiscordWebhookChannel:
 
 # ---------- ntfy ----------
 
-NTFY_TOPIC_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+NTFY_TOPIC_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}\Z")
 
 # ntfy's documented priority levels, low to high. Anything else is a
 # caller bug, not a value ntfy will just clamp -- reject it up front.

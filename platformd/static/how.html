@@ -8,7 +8,9 @@
   :root {
     --ink: #131517;
     --ink-64: rgba(19, 21, 23, .64);
-    --ink-44: rgba(19, 21, 23, .44);
+    /* .60, not .44: at .44 this token measured 2.85:1 on --bg,
+       below the 4.5:1 WCAG AA floor for body-size text. */
+    --ink-muted: rgba(19, 21, 23, .60);
     --hairline: rgba(19, 21, 23, .08);
     --bg: #F7F8F9;
     --surface: #FFFFFF;
@@ -25,7 +27,7 @@
     :root {
       --ink: #F2F3F4;
       --ink-64: rgba(242, 243, 244, .64);
-      --ink-44: rgba(242, 243, 244, .44);
+      --ink-muted: rgba(242, 243, 244, .56);
       --hairline: rgba(242, 243, 244, .10);
       --bg: #0E0F10;
       --surface: #161819;
@@ -50,6 +52,31 @@
   body { font-size: 15px; line-height: 28px; }
 
   a { color: inherit; }
+
+  /* Match index.html: a visible keyboard focus ring on every link. */
+  a:focus-visible {
+    outline: 2px solid #2563eb;
+    outline-offset: 2px;
+    border-radius: 3px;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    a:focus-visible { outline-color: #7aa2ff; }
+  }
+
+  html { scroll-behavior: smooth; }
+
+  /* The in-page #automating jump lands under nothing here, but keep the
+     anchor clear of the top edge. */
+  [id] { scroll-margin-top: 24px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after {
+      animation-duration: .01ms !important;
+      transition-duration: .01ms !important;
+    }
+  }
 
   .shell {
     max-width: var(--shell);
@@ -89,7 +116,7 @@
     font-weight: 500;
     text-transform: uppercase;
     letter-spacing: .08em;
-    color: var(--ink-44);
+    color: var(--ink-muted);
     margin: 0 0 16px;
   }
 
@@ -206,7 +233,7 @@
 
   footer.site p {
     font-size: 12px;
-    color: var(--ink-44);
+    color: var(--ink-muted);
     margin: 0;
   }
 
@@ -230,7 +257,6 @@
     <div class="doc">
 
       <section class="doc-hero">
-        <p class="eyebrow">How it works</p>
         <h1>What Dropwatch does, and what it doesn't</h1>
         <p class="lede">
           This page explains, plainly, what happens between a drop opening

@@ -1,0 +1,7 @@
+# Allowlist build context for Dockerfile.dropwatch: ship code + catalog only,
+# never repo logs, snapshots, or local config.
+*
+!platformd/
+!adapters/
+!deploy/campgrounds.json
+**/__pycache__

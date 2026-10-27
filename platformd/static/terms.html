@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Terms — Dropwatch</title>
+<style>
+  :root {
+    --ink: #131517;
+    --ink-64: rgba(19, 21, 23, .64);
+    /* .60, not .44: at .44 this token measured 2.85:1 on --bg,
+       below the 4.5:1 WCAG AA floor for body-size text. */
+    --ink-muted: rgba(19, 21, 23, .60);
+    --hairline: rgba(19, 21, 23, .08);
+    --bg: #F7F8F9;
+    --surface: #FFFFFF;
+    --inverted: #131517;
+    --inverted-ink: #F7F8F9;
+    --radius: 8px;
+    --measure: 448px;
+    --shell: 1120px;
+    --status-green: #1a8754;
+    --status-amber: #b45309;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ink: #F2F3F4;
+      --ink-64: rgba(242, 243, 244, .64);
+      --ink-muted: rgba(242, 243, 244, .56);
+      --hairline: rgba(242, 243, 244, .10);
+      --bg: #0E0F10;
+      --surface: #161819;
+      --inverted: #F2F3F4;
+      --inverted-ink: #0E0F10;
+      --status-green: #3ecb82;
+      --status-amber: #e0a030;
+    }
+  }
+
+  * { box-sizing: border-box; }
+
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  body { font-size: 15px; line-height: 28px; }
+
+  a { color: inherit; }
+
+  /* Match index.html: a visible keyboard focus ring on every link. */
+  a:focus-visible {
+    outline: 2px solid #2563eb;
+    outline-offset: 2px;
+    border-radius: 3px;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    a:focus-visible { outline-color: #7aa2ff; }
+  }
+
+  html { scroll-behavior: smooth; }
+
+  /* The in-page #automating jump lands under nothing here, but keep the
+     anchor clear of the top edge. */
+  [id] { scroll-margin-top: 24px; }
+
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto; }
+    *, *::before, *::after {
+      animation-duration: .01ms !important;
+      transition-duration: .01ms !important;
+    }
+  }
+
+  .shell {
+    max-width: var(--shell);
+    margin: 0 auto;
+    padding: 0 24px;
+  }
+
+  /* -------------------------------------------------- header -------- */
+
+  header.site {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: color-mix(in srgb, var(--bg) 85%, transparent);
+    -webkit-backdrop-filter: blur(8px);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--hairline);
+  }
+
+  header.site .shell {
+    height: 64px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .wordmark {
+    font-size: 14px;
+    font-weight: 600;
+    text-decoration: none;
+  }
+
+  /* -------------------------------------------------- type ----------- */
+
+  .eyebrow {
+    font-size: 12px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    color: var(--ink-muted);
+    margin: 0 0 16px;
+  }
+
+  h1 {
+    font-size: 30px;
+    font-weight: 600;
+    letter-spacing: -0.75px;
+    line-height: 1.2;
+    margin: 0 0 20px;
+    max-width: var(--measure);
+  }
+
+  .lede {
+    font-size: 15px;
+    line-height: 28px;
+    color: var(--ink-64);
+    margin: 0;
+    max-width: var(--measure);
+  }
+
+  .divider {
+    border: none;
+    border-top: 1px solid var(--hairline);
+    margin: 0;
+  }
+
+  /* -------------------------------------------------- document ------- */
+
+  .doc {
+    max-width: var(--measure);
+    padding: 96px 0 96px;
+  }
+
+  .doc-hero { margin-bottom: 64px; }
+
+  .doc-section { margin: 0 0 64px; }
+  .doc-section:last-child { margin-bottom: 0; }
+
+  .doc-section h2 {
+    font-size: 16px;
+    font-weight: 600;
+    line-height: 1.4;
+    margin: 0 0 16px;
+  }
+
+  .doc-section p {
+    margin: 0 0 16px;
+    color: var(--ink);
+  }
+
+  .doc-section p:last-child { margin-bottom: 0; }
+
+  .doc-section p.muted { color: var(--ink-64); }
+
+  .doc-section ol,
+  .doc-section ul {
+    margin: 0 0 16px;
+    padding-left: 20px;
+  }
+
+  .doc-section ol:last-child,
+  .doc-section ul:last-child { margin-bottom: 0; }
+
+  .doc-section li { margin: 0 0 6px; }
+  .doc-section li:last-child { margin-bottom: 0; }
+
+  .doc-section h3 {
+    font-size: 13px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .04em;
+    color: var(--ink-64);
+    margin: 28px 0 10px;
+  }
+
+  .doc-section h3:first-of-type { margin-top: 0; }
+
+  /* -------------------------------------------------- status badge --- */
+
+  .badge-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 16px 0;
+    padding: 10px 12px;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius);
+    background: var(--surface);
+    max-width: fit-content;
+  }
+
+  .status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex: none;
+    background: var(--status-green);
+  }
+
+  .status-dot.amber { background: var(--status-amber); }
+
+  .badge-row span.label {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--ink-64);
+  }
+
+  /* -------------------------------------------------- footer -------- */
+
+  footer.site {
+    padding: 32px 0 64px;
+    border-top: 1px solid var(--hairline);
+  }
+
+  footer.site p {
+    font-size: 12px;
+    color: var(--ink-muted);
+    margin: 0;
+  }
+
+  @media (max-width: 560px) {
+    .doc { padding: 64px 0 64px; }
+    .doc-hero { margin-bottom: 48px; }
+    .doc-section { margin-bottom: 48px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="site">
+  <div class="shell">
+    <a class="wordmark" href="/">Dropwatch</a>
+  </div>
+</header>
+
+<main>
+  <div class="shell">
+    <div class="doc">
+      <!-- Operator details in [brackets] must be filled in before launch.
+           Plain-language starting point, not legal advice. -->
+      <section class="doc-hero">
+        <h1>Terms of service</h1>
+        <p class="lede">Last updated October 27, 2026. Short version: we send alerts, you book. We can't promise you'll get the site.</p>
+      </section>
+
+      <section class="doc-section">
+        <h2>The service</h2>
+        <p>Dropwatch checks public campsite availability on recreation.gov for the campgrounds and dates you choose, and sends an alert to the channel you verify (Discord, ntfy, or a webhook) when a site opens up.</p>
+        <p>Dropwatch is not affiliated with, endorsed by, or operated by recreation.gov or any government agency. We never book, hold, or pay for a reservation for you, and we never sign in to any account on your behalf.</p>
+      </section>
+
+      <section class="doc-section">
+        <h2>No guarantee</h2>
+        <p>Availability changes in seconds and other people are looking too. An alert is a head start, not a reservation. Checks can be delayed or missed when the upstream site is slow, changes its format, or limits requests; we work to keep that rare but don't promise it won't happen.</p>
+        <p>Free alerts are sent 60 seconds after paid ones.</p>
+      </section>
+
+      <section class="doc-section">
+        <h2>Paid plan</h2>
+        <p>The paid plan is a monthly subscription billed through Stripe. It makes alerts to your verified destination instant. It renews each month until you cancel.</p>
+        <p>Cancel anytime from the Manage billing link at the bottom of the home page; you keep instant alerts until the end of the period you paid for.</p>
+        <p>If Dropwatch didn't work for you, write to [support email] within 14 days of a charge and we'll refund it.</p>
+      </section>
+
+      <section class="doc-section">
+        <h2>Fair use</h2>
+        <p>Watch only destinations you control. Don't use Dropwatch to message other people, to resell alerts, or to drive automated booking tools. We may disable watches that break these rules.</p>
+      </section>
+
+      <section class="doc-section">
+        <h2>Liability</h2>
+        <p>Dropwatch is provided as is. To the extent the law allows, our total liability to you for any claim is limited to what you paid us in the 3 months before it, and we aren't liable for indirect losses such as a missed trip.</p>
+      </section>
+
+      <section class="doc-section">
+        <h2>Changes and contact</h2>
+        <p>We'll post changes here and update the date above. Operated by [operator legal name], [city, state]. Questions: [support email].</p>
+      </section>
+
+    </div>
+  </div>
+</main>
+
+<footer class="site">
+  <div class="shell">
+    <p><a href="/">Dropwatch</a> &middot; <a href="/how">How it works</a> &middot; <a href="/terms">Terms</a> &middot; <a href="/privacy">Privacy</a></p>
+  </div>
+</footer>
+
+</body>
+</html>

@@ -63,6 +63,8 @@ _MONTH_URL_TEMPLATE = (
     "?start_date={start_date}"
 )
 
+_SITE_URL_TEMPLATE = "https://www.recreation.gov/camping/campsites/{site_id}"
+
 _ACCEPT_HEADERS = {
     "Accept": "application/json",
     "Content-Type": "application/json",
@@ -98,6 +100,11 @@ class RecreationGovAdapter(SourceAdapter):
             campground_id=campground_id, start_date=start_date
         )
         return http_get(url, _ACCEPT_HEADERS)
+
+    def fetch_key(self, target, date):
+        """One request returns the whole month, so dates in the same
+        month share a fetch (see platformd.poller)."""
+        return date[:7]
 
     def parse(self, raw, target, date):
         if not isinstance(raw, dict) or "campsites" not in raw:
@@ -144,7 +151,8 @@ class RecreationGovAdapter(SourceAdapter):
 
             unit_id = "%s:%s:%s" % (campground_id, site_id, date)
 
-            meta = {"raw_state": raw_state, "campsite_type": campsite_type}
+            meta = {"raw_state": raw_state, "campsite_type": campsite_type,
+                    "url": _SITE_URL_TEMPLATE.format(site_id=site_id)}
 
             observations.append(observation(unit_id, date, state, label=label, meta=meta))
 

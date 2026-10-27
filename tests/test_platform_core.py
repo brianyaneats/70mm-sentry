@@ -109,15 +109,29 @@ class SubscriptionLifecycleTests(unittest.TestCase):
                 "SELECT COUNT(*) AS n FROM subscriptions"
             ).fetchone()["n"], 1)
 
-    def test_subscribe_does_not_dedupe_pending_or_disabled(self):
+    def test_resubscribe_inside_cooldown_returns_live_row_without_new_code(self):
+        # Each call used to mint AND send another code: a free message
+        # cannon at any destination, and N live codes to brute-force.
         pending = core.subscribe(self.conn, DROP, "telegram", "a", "paid", T0)
-        self.assertEqual(pending["status"], "pending_verify")
         again = core.subscribe(self.conn, DROP, "telegram", "a", "paid", T0 + 1)
-        self.assertNotEqual(again["id"], pending["id"])
+        self.assertEqual(again["id"], pending["id"])
+        self.assertEqual(again["verify_code"], pending["verify_code"])
         self.assertEqual(
             self.conn.execute(
                 "SELECT COUNT(*) AS n FROM subscriptions"
-            ).fetchone()["n"], 2)
+            ).fetchone()["n"], 1)
+
+    def test_resubscribe_after_cooldown_supersedes_the_live_code(self):
+        first = core.subscribe(self.conn, DROP, "telegram", "a", "paid", T0)
+        later = T0 + core.RESEND_COOLDOWN_SECONDS
+        second = core.subscribe(self.conn, DROP, "telegram", "a", "paid", later)
+        self.assertNotEqual(second["id"], first["id"])
+        self.assertEqual(core.get_subscription(self.conn, first["id"])["status"],
+                         "disabled")
+        live = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM subscriptions "
+            "WHERE status='pending_verify'").fetchone()["n"]
+        self.assertEqual(live, 1, "a destination never has two codes in play")
 
     def test_subscribe_stores_webhook_secret_when_given(self):
         row = core.subscribe(self.conn, DROP, "webhook", "https://x.example/hook",
@@ -300,7 +314,9 @@ class RecordEventTests(unittest.TestCase):
     def test_different_drops_are_independent_for_dedup(self):
         core.register_drop(self.conn, "drop-2", "Drop Two", now=T0)
         active_sub(self.conn, DROP, "telegram", "a", "paid", T0)
-        active_sub(self.conn, "drop-2", "telegram", "a", "paid", T0)
+        # one code per destination per cooldown, across drops
+        active_sub(self.conn, "drop-2", "telegram", "a", "paid",
+                   T0 + core.RESEND_COOLDOWN_SECONDS)
 
         core.record_event(self.conn, DROP, {
             "event_id": "evt-1", "kind": "new_showtime", "unit_id": "unit-1",

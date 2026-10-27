@@ -126,8 +126,15 @@ def reset_provider_breakers():
     _provider_breakers.clear()
 
 
-def _format_message(row):
-    """One human-readable line: "<drop title>: <kind> — <unit label>".
+# Poller event kinds read as jargon in a push notification.
+_KIND_LABELS = {"opened": "site opened", "new_listing": "new site listed"}
+
+
+def _format_message(row, public_url=None):
+    """"<drop title>: <kind> — <unit label>", then one line each for what
+    the event carries: the night, a booking link, and (when the public
+    URL is configured) a one-click unsubscribe link -- an alert someone
+    can't act on or stop is not a product.
 
     label prefers the event's own payload_json["label"] (what adapters'
     observation() calls it -- e.g. "7:00 PM", "Site A12"; see
@@ -137,11 +144,21 @@ def _format_message(row):
     """
     payload = json.loads(row["payload_json"]) if row["payload_json"] else {}
     label = payload.get("label") or row["unit_id"] or "update"
-    return "%s: %s — %s" % (row["drop_title"], row["kind"], label)
+    kind = _KIND_LABELS.get(row["kind"], row["kind"])
+    lines = ["%s: %s — %s" % (row["drop_title"], kind, label)]
+    if payload.get("date"):
+        lines.append("Night of %s" % payload["date"])
+    if payload.get("url"):
+        lines.append("Book: %s" % payload["url"])
+    if public_url and row["unsub_token"]:
+        lines.append("Stop these alerts: %s/unsubscribe?token=%s"
+                     % (public_url.rstrip("/"), row["unsub_token"]))
+    return "\n".join(lines)
 
 
 def dispatch(conn, channels, now=None,
-             zero_delivered_deadline_seconds=ZERO_DELIVERED_DEADLINE_SECONDS):
+             zero_delivered_deadline_seconds=ZERO_DELIVERED_DEADLINE_SECONDS,
+             public_url=None):
     """Run one dispatch pass. `now` must be passed explicitly by callers
     (tests never rely on wall-clock time / sleeps to cross due-boundaries).
     """
@@ -154,6 +171,7 @@ def dispatch(conn, channels, now=None,
         "       o.created_at AS created_at, "
         "       s.channel AS channel, s.address AS address, "
         "       s.status AS sub_status, s.webhook_secret AS webhook_secret, "
+        "       s.unsub_token AS unsub_token, "
         "       e.drop_id AS drop_id, e.event_id AS event_id, "
         "       e.kind AS kind, e.unit_id AS unit_id, e.recorded_at AS recorded_at, "
         "       e.payload_json AS payload_json, d.title AS drop_title "
@@ -233,9 +251,10 @@ def dispatch(conn, channels, now=None,
         try:
             adapter = channels[channel]
             if context is not None:
-                ok = adapter.send(row["address"], _format_message(row), context=context)
+                ok = adapter.send(row["address"], _format_message(row, public_url),
+                                  context=context)
             else:
-                ok = adapter.send(row["address"], _format_message(row))
+                ok = adapter.send(row["address"], _format_message(row, public_url))
             if ok is not True:
                 raise RuntimeError(
                     "channel %r send() returned %r, expected True" % (channel, ok))

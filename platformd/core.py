@@ -23,6 +23,7 @@ platformd.outbox.dispatch() re-checks status per-row at send time so a
 STOP is honored even for alerts already sitting in the outbox.
 """
 
+import datetime as dt
 import json
 import random
 import secrets
@@ -64,7 +65,8 @@ class VerifyCodeExpired(Exception):
 # ---------------------------------------------------------------- drops --
 
 def register_drop(conn, drop_id, title, description=None, source=None,
-                   risk_tier=None, status="active", now=None):
+                   risk_tier=None, status="active", now=None, adapter=None,
+                   target=None):
     """Register drop_id in the catalog. Returns the drop row.
 
     Idempotent: if drop_id is already registered this is a no-op that
@@ -72,6 +74,9 @@ def register_drop(conn, drop_id, title, description=None, source=None,
     resurrects a paused drop back to active or edits a live catalog
     entry's fields. (A separate "update/pause a drop" operation is out
     of scope for this wave; nothing here needs it yet.)
+
+    adapter/target: set for a drop the poller should watch (see
+    active_watches()); target is the adapter's opaque target dict.
     """
     if status not in ("active", "paused"):
         raise ValueError("unknown drop status %r (expected 'active' or "
@@ -85,9 +90,10 @@ def register_drop(conn, drop_id, title, description=None, source=None,
 
     conn.execute(
         "INSERT INTO drops "
-        "(id, title, description, source, risk_tier, status, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (drop_id, title, description, source, risk_tier, status, now),
+        "(id, title, description, source, risk_tier, status, created_at, "
+        " adapter, target_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (drop_id, title, description, source, risk_tier, status, now,
+         adapter, json.dumps(target) if target is not None else None),
     )
     conn.commit()
     return get_drop(conn, drop_id)
@@ -126,8 +132,32 @@ def _generate_verify_code():
     return "%0*d" % (VERIFY_CODE_DIGITS, n)
 
 
-def subscribe(conn, drop_id, channel, address, tier, now, webhook_secret=None):
+# A destination gets at most one verification code per this window, and
+# only ever one live code at a time. Without it, every subscribe call for
+# the same address minted and SENT another code: an unauthenticated
+# message cannon at any ntfy topic / Discord webhook / URL, and N live
+# rows meant N parallel 6-digit codes to brute-force.
+RESEND_COOLDOWN_SECONDS = 60
+
+
+class ResendCooldown(Exception):
+    """A code went to this destination less than RESEND_COOLDOWN_SECONDS
+    ago for a different watch. Raised rather than silently minting, so
+    the API can answer 429 and the destination gets one code a minute
+    no matter how many campgrounds a caller cycles through."""
+
+    def __init__(self, retry_after):
+        super().__init__("verification code sent recently")
+        self.retry_after = retry_after
+
+
+def subscribe(conn, drop_id, channel, address, tier, now, webhook_secret=None,
+              date_from=None, date_to=None):
     """Register (channel, address)'s interest in drop_id. Returns the row.
+
+    A watch is (drop_id, channel, address, date_from, date_to); the dates
+    ("YYYY-MM-DD", inclusive, None = every date) narrow which events fan
+    out to it. Everything below that says "triple" means that key.
 
     Dedup: an existing status='active' subscription for the same
     (drop_id, channel, address) is returned as-is -- no new row, no new
@@ -173,35 +203,49 @@ def subscribe(conn, drop_id, channel, address, tier, now, webhook_secret=None):
                 "drop %r is risk_tier=yellow; paid subscriptions are not "
                 "allowed on a tolerated-gray source" % drop_id)
 
+    key_sql = ("drop_id = ? AND channel = ? AND address = ? "
+               "AND date_from IS ? AND date_to IS ?")
+    key = (drop_id, channel, address, date_from, date_to)
     existing = conn.execute(
-        "SELECT * FROM subscriptions "
-        "WHERE drop_id = ? AND channel = ? AND address = ? AND status = 'active'",
-        (drop_id, channel, address),
+        "SELECT * FROM subscriptions WHERE " + key_sql + " AND status = 'active'",
+        key,
     ).fetchone()
     if existing is not None:
         return existing
 
-    stale_pending = conn.execute(
-        "SELECT id, created_at FROM subscriptions "
-        "WHERE drop_id = ? AND channel = ? AND address = ? "
-        "AND status = 'pending_verify'",
-        (drop_id, channel, address),
+    pending = conn.execute(
+        "SELECT * FROM subscriptions WHERE " + key_sql +
+        " AND status = 'pending_verify' ORDER BY created_at DESC",
+        key,
     ).fetchall()
-    for stale in stale_pending:
-        if now - stale["created_at"] >= VERIFY_CODE_TTL_SECONDS:
-            conn.execute(
-                "UPDATE subscriptions SET status='disabled' WHERE id=?",
-                (stale["id"],),
-            )
+    if pending and now - pending[0]["created_at"] < RESEND_COOLDOWN_SECONDS:
+        # Inside the cooldown: hand back the live row, mint and send
+        # nothing (callers detect "fresh" via created_at == now).
+        return pending[0]
+    last_sent = conn.execute(
+        "SELECT MAX(created_at) FROM subscriptions "
+        "WHERE channel = ? AND address = ? AND verify_code IS NOT NULL",
+        (channel, address),
+    ).fetchone()[0]
+    if last_sent is not None and now - last_sent < RESEND_COOLDOWN_SECONDS:
+        raise ResendCooldown(RESEND_COOLDOWN_SECONDS - (now - last_sent))
+    # Past the cooldown, the new code supersedes every earlier one --
+    # live or expired -- so a destination never has two codes in play.
+    for old in pending:
+        conn.execute(
+            "UPDATE subscriptions SET status='disabled' WHERE id=?",
+            (old["id"],),
+        )
     conn.commit()
 
     code = _generate_verify_code()
     cur = conn.execute(
         "INSERT INTO subscriptions "
         "(drop_id, channel, address, tier, status, verify_code, "
-        " verify_attempts, webhook_secret, created_at) "
-        "VALUES (?, ?, ?, ?, 'pending_verify', ?, 0, ?, ?)",
-        (drop_id, channel, address, tier, code, webhook_secret, now),
+        " verify_attempts, webhook_secret, created_at, date_from, date_to) "
+        "VALUES (?, ?, ?, ?, 'pending_verify', ?, 0, ?, ?, ?, ?)",
+        (drop_id, channel, address, tier, code, webhook_secret, now,
+         date_from, date_to),
     )
     conn.commit()
     return get_subscription(conn, cur.lastrowid)
@@ -370,13 +414,32 @@ def record_event(conn, drop_id, event, now=None):
                 (drop_id, unit_id, state, ever_available, recorded_at),
             )
 
+        # A watch with dates only hears about events on those dates; a
+        # destination with several overlapping watches gets ONE alert.
+        # Paid = the row's own tier or an active entitlement for the
+        # destination -- except on a yellow drop, which is never sold.
+        date = event.get("date") or event.get("payload", {}).get("date")
         subs = conn.execute(
-            "SELECT id, tier FROM subscriptions "
-            "WHERE drop_id = ? AND status = 'active'",
-            (drop_id,),
+            "SELECT s.id, s.tier, s.channel, s.address, "
+            "       e.status AS entitlement FROM subscriptions s "
+            "LEFT JOIN entitlements e "
+            "  ON e.channel = s.channel AND e.address = s.address "
+            "WHERE s.drop_id = ? AND s.status = 'active' "
+            "  AND (? IS NULL OR s.date_from IS NULL OR s.date_from <= ?) "
+            "  AND (? IS NULL OR s.date_to IS NULL OR s.date_to >= ?) "
+            "ORDER BY s.id",
+            (drop_id, date, date, date, date),
         ).fetchall()
+        sellable = (drop["risk_tier"] or "").lower() != "yellow"
+        seen = set()
         for sub in subs:
-            delay = TIER_DELAYS.get(sub["tier"], DEFAULT_TIER_DELAY)
+            if (sub["channel"], sub["address"]) in seen:
+                continue
+            seen.add((sub["channel"], sub["address"]))
+            tier = sub["tier"]
+            if sellable and sub["entitlement"] == "active":
+                tier = "paid"
+            delay = TIER_DELAYS.get(tier, DEFAULT_TIER_DELAY)
             not_before = recorded_at + delay
             conn.execute(
                 "INSERT INTO outbox "
@@ -392,3 +455,74 @@ def record_event(conn, drop_id, event, now=None):
         conn.commit()
 
     return event_row_id
+
+
+# --------------------------------------------------------- entitlements --
+
+def is_entitled(conn, channel, address):
+    row = conn.execute(
+        "SELECT status FROM entitlements WHERE channel = ? AND address = ?",
+        (channel, address)).fetchone()
+    return row is not None and row["status"] == "active"
+
+
+def grant_entitlement(conn, subscription_id, stripe_customer,
+                      stripe_subscription, now):
+    """Checkout completed for subscription_id: its destination goes paid.
+    Returns the (channel, address) granted, or None for an unknown id."""
+    sub = get_subscription(conn, subscription_id)
+    if sub is None:
+        return None
+    conn.execute(
+        "INSERT INTO entitlements (channel, address, status, stripe_customer, "
+        "stripe_subscription, updated_at) VALUES (?, ?, 'active', ?, ?, ?) "
+        "ON CONFLICT(channel, address) DO UPDATE SET status = 'active', "
+        "  stripe_customer = excluded.stripe_customer, "
+        "  stripe_subscription = excluded.stripe_subscription, "
+        "  updated_at = excluded.updated_at",
+        (sub["channel"], sub["address"], stripe_customer,
+         stripe_subscription, now))
+    conn.commit()
+    return sub["channel"], sub["address"]
+
+
+def set_entitlement_by_stripe_subscription(conn, stripe_subscription,
+                                           active, now):
+    """Stripe says a subscription changed state (renewed, cancelled,
+    unpaid). Returns how many entitlements it touched."""
+    cur = conn.execute(
+        "UPDATE entitlements SET status = ?, updated_at = ? "
+        "WHERE stripe_subscription = ?",
+        ("active" if active else "inactive", now, stripe_subscription))
+    conn.commit()
+    return cur.rowcount
+
+
+# ---------------------------------------------------------------- watches --
+
+def active_watches(conn, today, horizon_days=366):
+    """Poll work implied by live subscriptions: one watch per adapter-
+    backed drop with at least one active subscription, over the union of
+    their date ranges clamped to [today, today + horizon_days). A drop
+    with nobody watching it costs no upstream requests at all."""
+    end = today + dt.timedelta(days=horizon_days)
+    rows = conn.execute(
+        "SELECT d.id, d.adapter, d.target_json, s.date_from, s.date_to "
+        "FROM drops d JOIN subscriptions s ON s.drop_id = d.id "
+        "WHERE d.adapter IS NOT NULL AND d.status = 'active' "
+        "  AND s.status = 'active' AND s.date_to IS NOT NULL "
+        "  AND s.date_to >= ?",
+        (today.isoformat(),)).fetchall()
+    watches = {}
+    for r in rows:
+        w = watches.setdefault(r["id"], {
+            "drop_id": r["id"], "adapter": r["adapter"],
+            "target": json.loads(r["target_json"]), "dates": set()})
+        day = max(dt.date.fromisoformat(r["date_from"] or r["date_to"]), today)
+        last = min(dt.date.fromisoformat(r["date_to"]), end)
+        while day <= last:
+            w["dates"].add(day.isoformat())
+            day += dt.timedelta(days=1)
+    for w in watches.values():
+        w["dates"] = sorted(w["dates"])
+    return [w for w in watches.values() if w["dates"]]

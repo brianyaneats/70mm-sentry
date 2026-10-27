@@ -32,11 +32,13 @@ TAG_BUDGET = "BUDGET"                # governor: daily request budget denial
 TAG_BREAKER = "BREAKER"              # governor/outbox: breaker-open denial
 TAG_RATELIMIT = "RATELIMIT"          # core: verify-attempt budget exhausted
 TAG_RUNNER = "RUNNER"                # runner: tick heartbeat, startup/shutdown
+TAG_POLL = "POLL"                    # poller: per-fetch latency/outcome, detections
+TAG_BILLING = "BILLING"              # stripe webhook: verified events, rejections
 
 KNOWN_TAGS = frozenset({
     TAG_PIPE, TAG_BLIND, TAG_REFUSED, TAG_PARSE,
     TAG_DELIVERY, TAG_ZERO_DELIVERED, TAG_BUDGET, TAG_BREAKER,
-    TAG_RATELIMIT, TAG_RUNNER,
+    TAG_RATELIMIT, TAG_RUNNER, TAG_POLL, TAG_BILLING,
 })
 
 _RING_MAXLEN = 4000
